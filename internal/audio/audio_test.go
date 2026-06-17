@@ -27,6 +27,38 @@ func TestEnsureSilenceProducesCleanMP3(t *testing.T) {
 	}
 }
 
+func TestEnsureSilenceConcurrentSameOutput(t *testing.T) {
+	requireFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "silence.mp3")
+	errCh := make(chan error, 8)
+	start := make(chan struct{})
+	for range cap(errCh) {
+		go func() {
+			<-start
+			errCh <- EnsureSilence(ctx, path, 20)
+		}()
+	}
+
+	close(start)
+	for range cap(errCh) {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ValidateCleanMP3(ctx, path); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "silence.mp3.*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files left behind: %v", matches)
+	}
+}
+
 func TestTranscodeRejectsSourceVBRButOutputsCleanMP3(t *testing.T) {
 	requireFFmpeg(t)
 	ctx := context.Background()
@@ -49,6 +81,48 @@ func TestTranscodeRejectsSourceVBRButOutputsCleanMP3(t *testing.T) {
 	}
 	if _, err := ValidateCleanMP3(ctx, dst); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTranscodeCleanMP3ConcurrentSameOutput(t *testing.T) {
+	requireFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.mp3")
+	dst := filepath.Join(dir, "clean.mp3")
+	if err := exec.CommandContext(ctx, "ffmpeg",
+		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+		"-c:a", "libmp3lame", "-q:a", "4",
+		"-f", "mp3", src,
+	).Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 6)
+	start := make(chan struct{})
+	for range cap(errCh) {
+		go func() {
+			<-start
+			errCh <- TranscodeCleanMP3(ctx, src, dst)
+		}()
+	}
+
+	close(start)
+	for range cap(errCh) {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ValidateCleanMP3(ctx, dst); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "clean.mp3.*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files left behind: %v", matches)
 	}
 }
 

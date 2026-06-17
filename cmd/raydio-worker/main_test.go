@@ -117,6 +117,52 @@ func TestRunCreatesSilenceAndDatabase(t *testing.T) {
 	}
 }
 
+func TestRunCreatesSharedSilenceForMultipleRadios(t *testing.T) {
+	requireFFmpeg(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dir := t.TempDir()
+	layout := paths.New(dir, "")
+	radios := []radioConfig{
+		{Alias: "monthly", UUID: testStationUUID, InboxDir: filepath.Join(layout.InboxDir, testStationUUID)},
+		{Alias: "daily", UUID: "00000000-0000-0000-0000-000000000002", InboxDir: filepath.Join(layout.InboxDir, "00000000-0000-0000-0000-000000000002")},
+		{Alias: "weekly", UUID: "00000000-0000-0000-0000-000000000003", InboxDir: filepath.Join(layout.InboxDir, "00000000-0000-0000-0000-000000000003")},
+		{Alias: "hourly", UUID: "00000000-0000-0000-0000-000000000004", InboxDir: filepath.Join(layout.InboxDir, "00000000-0000-0000-0000-000000000004")},
+	}
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, config{
+			DataDir:        dir,
+			InboxDir:       layout.InboxDir,
+			CacheDir:       layout.CacheDir,
+			DBPath:         layout.DBPath,
+			Radios:         radios,
+			RescanInterval: 50 * time.Millisecond,
+			GapFrames:      5,
+		})
+	}()
+
+	waitFor(t, 5*time.Second, func() bool {
+		if _, err := os.Stat(paths.SilencePath(layout.CacheDir, 5)); err != nil {
+			return false
+		}
+		if _, err := os.Stat(layout.DBPath); err != nil {
+			return false
+		}
+		return true
+	})
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+}
+
 func TestWorkerScansMP3IntoCache(t *testing.T) {
 	requireFFmpeg(t)
 	ctx, cancel := context.WithCancel(context.Background())

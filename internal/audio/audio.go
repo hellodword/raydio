@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,8 @@ const (
 	SamplesPerFrame int64 = 1152
 	FrameDurationMs int64 = 24
 )
+
+var silenceOutputLocks sync.Map
 
 type Probe struct {
 	Format struct {
@@ -70,10 +73,13 @@ func TranscodeCleanMP3(ctx context.Context, input, output string) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return err
 	}
-	tmp := output + ".tmp"
-	_ = os.Remove(tmp)
+	tmp, err := tempOutput(output)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
 	args := []string{
-		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-i", input,
 		"-map", "0:a:0", "-vn", "-sn", "-dn",
 		"-ac", "2", "-ar", "48000",
@@ -83,34 +89,43 @@ func TranscodeCleanMP3(ctx context.Context, input, output string) error {
 		"-f", "mp3", tmp,
 	}
 	if err := run(ctx, "ffmpeg", args...); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	if _, err := ValidateCleanMP3(ctx, tmp); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, output)
+	return renameTemp(ctx, tmp, output, func(v Validation) bool {
+		return true
+	})
 }
 
 func EnsureSilence(ctx context.Context, output string, frames int64) error {
 	if frames <= 0 {
 		return errors.New("silence frame count must be positive")
 	}
-	if _, err := os.Stat(output); err == nil {
-		v, err := ValidateCleanMP3(ctx, output)
-		if err == nil && v.FrameCount >= frames {
+	if validSilence(ctx, output, frames) {
+		return nil
+	}
+	return withOutputLock(&silenceOutputLocks, output, func() error {
+		if validSilence(ctx, output, frames) {
 			return nil
 		}
-	}
+		return ensureSilence(ctx, output, frames)
+	})
+}
+
+func ensureSilence(ctx context.Context, output string, frames int64) error {
 	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
 		return err
 	}
-	tmp := output + ".tmp"
-	_ = os.Remove(tmp)
+	tmp, err := tempOutput(output)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp)
 	duration := time.Duration(frames*SamplesPerFrame) * time.Second / time.Duration(SampleRate)
 	args := []string{
-		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-nostdin", "-hide_banner", "-loglevel", "error", "-y",
 		"-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
 		"-t", fmt.Sprintf("%.6f", duration.Seconds()),
 		"-ac", "2", "-ar", "48000",
@@ -120,19 +135,57 @@ func EnsureSilence(ctx context.Context, output string, frames int64) error {
 		"-f", "mp3", tmp,
 	}
 	if err := run(ctx, "ffmpeg", args...); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	v, err := ValidateCleanMP3(ctx, tmp)
 	if err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	if v.FrameCount < frames {
-		_ = os.Remove(tmp)
 		return fmt.Errorf("silence has %d frames, want at least %d", v.FrameCount, frames)
 	}
-	return os.Rename(tmp, output)
+	return renameTemp(ctx, tmp, output, func(v Validation) bool {
+		return v.FrameCount >= frames
+	})
+}
+
+func validSilence(ctx context.Context, output string, frames int64) bool {
+	if _, err := os.Stat(output); err != nil {
+		return false
+	}
+	v, err := ValidateCleanMP3(ctx, output)
+	return err == nil && v.FrameCount >= frames
+}
+
+func withOutputLock(locks *sync.Map, output string, fn func() error) error {
+	actual, _ := locks.LoadOrStore(filepath.Clean(output), &sync.Mutex{})
+	mu := actual.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
+}
+
+func tempOutput(output string) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(output), filepath.Base(output)+".*.tmp")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
+}
+
+func renameTemp(ctx context.Context, tmp, output string, accept func(Validation) bool) error {
+	if err := os.Rename(tmp, output); err != nil {
+		if v, validateErr := ValidateCleanMP3(ctx, output); validateErr == nil && accept(v) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func ValidateCleanMP3(ctx context.Context, path string) (Validation, error) {
