@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 type File struct {
 	DataDir   string
 	GapFrames int64
+	LogLevel  slog.Level
 	Server    Server
 	Worker    Worker
 }
@@ -32,6 +34,7 @@ func Defaults() File {
 	return File{
 		DataDir:   "./data",
 		GapFrames: 209,
+		LogLevel:  slog.LevelDebug,
 		Server: Server{
 			Addr:             ":8080",
 			ScheduleInterval: time.Minute,
@@ -184,6 +187,12 @@ func assign(cfg *File, key, value string) error {
 			return fmt.Errorf("gap_frames must be an integer")
 		}
 		cfg.GapFrames = n
+	case "log_level":
+		level, err := parseLogLevel(value)
+		if err != nil {
+			return err
+		}
+		cfg.LogLevel = level
 	case "server.addr":
 		cfg.Server.Addr = value
 	case "server.schedule_interval":
@@ -204,4 +213,19 @@ func assign(cfg *File, key, value string) error {
 		return fmt.Errorf("unknown key %q", key)
 	}
 	return nil
+}
+
+func parseLogLevel(value string) (slog.Level, error) {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "DEBUG":
+		return slog.LevelDebug, nil
+	case "INFO":
+		return slog.LevelInfo, nil
+	case "WARN", "WARNING":
+		return slog.LevelWarn, nil
+	case "ERROR":
+		return slog.LevelError, nil
+	default:
+		return slog.LevelInfo, fmt.Errorf("log_level must be DEBUG, INFO, WARN, or ERROR")
+	}
 }

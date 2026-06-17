@@ -12,6 +12,10 @@ data_dir: ./data
 # At 48 kHz MP3, one frame is 24 ms. 209 frames is about 5.016 seconds.
 gap_frames: 209
 
+# Minimum structured log level for both binaries.
+# Supported values: DEBUG, INFO, WARN, ERROR.
+log_level: DEBUG
+
 server:
   # HTTP listen address for raydio.
   addr: ":8080"

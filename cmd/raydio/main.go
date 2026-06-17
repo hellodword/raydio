@@ -8,7 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,12 +24,14 @@ import (
 )
 
 type config struct {
+	ConfigPath       string
 	Addr             string
 	DataDir          string
 	CacheDir         string
 	DBPath           string
 	ScheduleInterval time.Duration
 	GapFrames        int64
+	LogLevel         slog.Level
 }
 
 type app struct {
@@ -44,14 +46,25 @@ func main() {
 		return
 	}
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("load config failed", "error", err)
+		os.Exit(1)
 	}
+	configureLogging(cfg.LogLevel)
+	slog.Debug("config loaded", "path", cfg.ConfigPath, "log_level", cfg.LogLevel.String())
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if err := run(ctx, cfg); err != nil {
-		log.Fatal(err)
+		slog.Error("raydio stopped", "error", err)
+		os.Exit(1)
 	}
+}
+
+func configureLogging(level slog.Level) {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	})))
 }
 
 func readConfig(args []string) (config, error) {
@@ -76,12 +89,14 @@ func readConfig(args []string) (config, error) {
 	}
 	layout := paths.New(fileCfg.DataDir, "")
 	return config{
+		ConfigPath:       configPath,
 		Addr:             fileCfg.Server.Addr,
 		DataDir:          layout.DataDir,
 		CacheDir:         layout.CacheDir,
 		DBPath:           layout.DBPath,
 		ScheduleInterval: fileCfg.Server.ScheduleInterval,
 		GapFrames:        fileCfg.GapFrames,
+		LogLevel:         fileCfg.LogLevel,
 	}, nil
 }
 
@@ -92,6 +107,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := paths.RequireServerCache(cfg.CacheDir, cfg.GapFrames); err != nil {
 		return err
 	}
+	slog.Debug("worker-prepared media cache found", "cache_dir", cfg.CacheDir, "gap_frames", cfg.GapFrames)
 	st, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
 		return err
@@ -102,6 +118,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := scheduler.Ensure(ctx, time.Now()); err != nil {
 		return err
 	}
+	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "schedule_interval", cfg.ScheduleInterval, "gap_frames", cfg.GapFrames)
 
 	a := &app{cfg: cfg, store: st, scheduler: scheduler}
 	go a.scheduleLoop(ctx)
@@ -116,7 +133,7 @@ func run(ctx context.Context, cfg config) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("raydio listening on %s", cfg.Addr)
+		slog.Info("raydio listening", "addr", cfg.Addr)
 		errCh <- srv.ListenAndServe()
 	}()
 
@@ -165,7 +182,9 @@ func (a *app) scheduleLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := a.scheduler.Ensure(ctx, time.Now()); err != nil {
-				log.Printf("schedule failed: %v", err)
+				slog.Error("schedule maintenance failed", "error", err)
+			} else {
+				slog.Debug("schedule maintenance complete")
 			}
 		}
 	}
@@ -197,6 +216,9 @@ func (a *app) serveWebFile(w http.ResponseWriter, r *http.Request, name, content
 }
 
 func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
+	slog.Debug("radio stream connected", "remote", r.RemoteAddr)
+	defer slog.Debug("radio stream disconnected", "remote", r.RemoteAddr)
+
 	h := w.Header()
 	h.Set("Content-Type", "audio/mpeg")
 	h.Set("Cache-Control", "no-store, no-transform")
@@ -222,11 +244,14 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 
 		chunks, err := a.scheduler.Chunks(ctx, time.Now(), 10)
 		if err != nil {
-			log.Printf("radio chunks: %v", err)
+			slog.Error("radio chunks failed", "remote", r.RemoteAddr, "error", err)
 			return
 		}
 		for _, ch := range chunks {
 			if err := writeChunk(ctx, w, ch); err != nil {
+				if ctx.Err() == nil {
+					slog.Debug("radio stream write stopped", "remote", r.RemoteAddr, "error", err)
+				}
 				return
 			}
 		}

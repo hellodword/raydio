@@ -5,7 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,12 +18,14 @@ import (
 )
 
 type config struct {
+	ConfigPath     string
 	DataDir        string
 	InboxDir       string
 	CacheDir       string
 	DBPath         string
 	RescanInterval time.Duration
 	GapFrames      int64
+	LogLevel       slog.Level
 }
 
 func main() {
@@ -32,14 +34,25 @@ func main() {
 		return
 	}
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("load config failed", "error", err)
+		os.Exit(1)
 	}
+	configureLogging(cfg.LogLevel)
+	slog.Debug("config loaded", "path", cfg.ConfigPath, "log_level", cfg.LogLevel.String())
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	if err := run(ctx, cfg); err != nil {
-		log.Fatal(err)
+		slog.Error("raydio-worker stopped", "error", err)
+		os.Exit(1)
 	}
+}
+
+func configureLogging(level slog.Level) {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	})))
 }
 
 func readConfig(args []string) (config, error) {
@@ -64,12 +77,14 @@ func readConfig(args []string) (config, error) {
 	}
 	layout := paths.New(fileCfg.DataDir, fileCfg.Worker.InboxDir)
 	return config{
+		ConfigPath:     configPath,
 		DataDir:        layout.DataDir,
 		InboxDir:       layout.InboxDir,
 		CacheDir:       layout.CacheDir,
 		DBPath:         layout.DBPath,
 		RescanInterval: fileCfg.Worker.RescanInterval,
 		GapFrames:      fileCfg.GapFrames,
+		LogLevel:       fileCfg.LogLevel,
 	}, nil
 }
 
@@ -80,6 +95,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
+	slog.Info("starting raydio-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "rescan_interval", cfg.RescanInterval, "gap_frames", cfg.GapFrames)
 	st, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
 		return err
@@ -115,23 +131,36 @@ func scanLoop(ctx context.Context, interval time.Duration, cat *catalog.Service)
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			slog.Debug("catalog scan tick")
 			if err := scan(ctx, cat); err != nil {
 				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 					return nil
 				}
-				log.Printf("scan failed: %v", err)
+				slog.Error("catalog scan failed", "error", err)
 			}
 		}
 	}
 }
 
 func scan(ctx context.Context, cat *catalog.Service) error {
+	start := time.Now()
+	slog.Debug("catalog scan starting")
 	result, err := cat.Scan(ctx)
 	if err != nil {
 		return err
 	}
+	attrs := []any{
+		"seen", result.Seen,
+		"processed", result.Processed,
+		"skipped", result.Skipped,
+		"errors", result.Errors,
+		"changed", result.Changed,
+		"duration", time.Since(start),
+	}
 	if result.Changed || result.Errors > 0 {
-		log.Printf("scan seen=%d processed=%d skipped=%d errors=%d changed=%t", result.Seen, result.Processed, result.Skipped, result.Errors, result.Changed)
+		slog.Info("catalog scan finished", attrs...)
+	} else {
+		slog.Debug("catalog scan finished", attrs...)
 	}
 	return nil
 }

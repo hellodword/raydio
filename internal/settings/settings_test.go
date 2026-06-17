@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,6 +14,7 @@ func TestLoadParsesConfigWithComments(t *testing.T) {
 # Shared settings.
 data_dir: /srv/raydio # root data directory
 gap_frames: 5
+log_level: WARN
 
 server:
   addr: ":18080"
@@ -34,6 +36,9 @@ worker:
 	}
 	if cfg.GapFrames != 5 {
 		t.Fatalf("GapFrames = %d", cfg.GapFrames)
+	}
+	if cfg.LogLevel != slog.LevelWarn {
+		t.Fatalf("LogLevel = %s", cfg.LogLevel)
 	}
 	if cfg.Server.Addr != ":18080" {
 		t.Fatalf("Server.Addr = %q", cfg.Server.Addr)
@@ -65,6 +70,9 @@ server:
 	}
 	if cfg.GapFrames != 209 {
 		t.Fatalf("GapFrames = %d", cfg.GapFrames)
+	}
+	if cfg.LogLevel != slog.LevelDebug {
+		t.Fatalf("LogLevel = %s", cfg.LogLevel)
 	}
 	if cfg.Server.ScheduleInterval != time.Minute {
 		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
@@ -104,5 +112,15 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected unknown key to fail")
+	}
+}
+
+func TestLoadRejectsInvalidLogLevel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("log_level: trace\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected invalid log level to fail")
 	}
 }

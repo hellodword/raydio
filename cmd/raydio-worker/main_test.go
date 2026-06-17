@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +27,7 @@ func TestReadConfigLoadsWorkerSettings(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`
 data_dir: /srv/raydio
 gap_frames: 7
+log_level: INFO
 server:
   addr: ":18080"
   schedule_interval: 250ms
@@ -57,6 +59,9 @@ worker:
 	}
 	if cfg.GapFrames != 7 {
 		t.Fatalf("GapFrames = %d", cfg.GapFrames)
+	}
+	if cfg.LogLevel != slog.LevelInfo {
+		t.Fatalf("LogLevel = %s", cfg.LogLevel)
 	}
 }
 

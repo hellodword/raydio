@@ -124,6 +124,7 @@ Supported keys:
 | --- | --- | --- |
 | `data_dir` | `./data` | Root data directory. |
 | `gap_frames` | `209` | Silence frames inserted between tracks. |
+| `log_level` | `DEBUG` | Minimum structured log level for both binaries. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
 | `worker.inbox_dir` | empty | Source MP3 directory. Empty means `<data_dir>/inbox`. |
@@ -135,6 +136,14 @@ At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
 Duration values use Go duration syntax, such as `500ms`, `15s`, `1m`, or `1h`.
 Relative `data_dir` and `worker.inbox_dir` paths are resolved from the directory
 that contains the config file.
+Log level values are `DEBUG`, `INFO`, `WARN`, or `ERROR`.
+
+## Logging
+
+Raydio uses Go `slog` structured text logs on stderr. Both binaries use the same
+`log_level` value from the config file. The example config defaults to `DEBUG`
+so development runs include startup settings, schedule ticks, stream lifecycle
+events, and worker scan summaries.
 
 ## Input Files and Metadata
 
@@ -368,6 +377,7 @@ cp tmp/origin/*.mp3 /tmp/raydio-demo/data/inbox/
 cat >/tmp/raydio-demo/config.yaml <<'YAML'
 data_dir: data
 gap_frames: 209
+log_level: DEBUG
 server:
   addr: "127.0.0.1:18080"
   schedule_interval: 1m
