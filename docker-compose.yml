@@ -1,0 +1,63 @@
+name: raydio
+
+x-runtime-hardening: &runtime-hardening
+  user: "65532:65532"
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777,nosuid,nodev,noexec
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  restart: unless-stopped
+
+x-raydio-app: &raydio-app
+  <<: *runtime-hardening
+  volumes:
+    - raydio-data:/srv/raydio/data
+    - ./config.docker.yaml:/srv/raydio/config.yaml:ro
+
+services:
+  raydio:
+    <<: *raydio-app
+    build:
+      context: .
+      target: raydio
+    image: raydio:local
+    command: ["-config", "/srv/raydio/config.yaml"]
+    expose:
+      - "8080"
+    mem_limit: 256m
+    cpus: "0.5"
+    depends_on:
+      - raydio-worker
+
+  suno-worker:
+    <<: *raydio-app
+    build:
+      context: .
+      target: suno-worker
+    image: raydio-suno-worker:local
+    command: ["-config", "/srv/raydio/config.yaml"]
+    mem_limit: 128m
+    cpus: "0.25"
+
+  raydio-worker:
+    <<: *raydio-app
+    build:
+      context: .
+      target: raydio-worker
+    image: raydio-worker:local
+    command: ["-config", "/srv/raydio/config.yaml"]
+    mem_limit: 256m
+    cpus: "0.5"
+
+  cloudflared:
+    <<: *runtime-hardening
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--no-autoupdate", "--url", "http://raydio:8080"]
+    depends_on:
+      - raydio
+
+volumes:
+  raydio-data:

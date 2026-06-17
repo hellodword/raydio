@@ -107,6 +107,36 @@ database are stored under `./data`.
 cache is missing, the server fails startup with guidance to run `raydio-worker`
 against the same data directory.
 
+## Docker Compose
+
+The Compose setup builds three local images and runs every container as
+UID/GID `65532`, with no root runtime user. `raydio` and `suno-worker` use
+distroless runtime images. `raydio-worker` uses Debian slim because it must run
+`ffmpeg` and `ffprobe`.
+
+Start the stack:
+
+```bash
+docker compose up --build
+```
+
+`cloudflare/cloudflared` starts a quick tunnel to `http://raydio:8080`. Read the
+public `trycloudflare.com` URL from:
+
+```bash
+docker compose logs -f cloudflared
+```
+
+The Docker config lives in `config.docker.yaml`. Its `server.addr` is `:8080`
+so the server listens inside the Compose network, and
+`server.trusted_proxy_cidrs` trusts the Docker bridge subnet so Raydio can use
+`CF-Connecting-IP`/`X-Forwarded-For` from cloudflared. The HTTP server is not
+published on a host port by default; public access goes through the quick
+tunnel.
+
+Runtime data is stored in the named volume `raydio-data`. The worker inbox is
+`/srv/raydio/data/inbox/<radio-uuid>` inside that volume.
+
 ## Command-Line Flags
 
 All binaries intentionally expose only the config path and help flags:

@@ -1,0 +1,44 @@
+# Raydio Docker Compose configuration.
+
+data_dir: /srv/raydio/data
+gap_frames: 209
+log_level: INFO
+
+radios:
+  - alias: electronic
+    uuid: 37e7cf90-4c91-48d4-8abe-964985438f57
+  - alias: shoegaze
+    uuid: 0d108340-b925-4a29-8da6-9a57e714be27
+  - alias: jazz
+    uuid: 36b4f483-7181-4521-bf78-6328135f3474
+  - alias: house
+    uuid: 1c716574-8091-42c5-a62a-8283bfbeffd9
+  - alias: soundtrack
+    uuid: 4c3382a7-4d2e-49de-a505-9b63bdf07315
+  - alias: classical
+    uuid: 3c18bc17-103d-4d5d-b0a3-a78413cbd158
+  - alias: ambient
+    uuid: fbe8a420-3b69-4dff-bb91-0b241f249bb2
+
+server:
+  addr: ":8080"
+  rate_limit_rps: 10
+  rate_limit_burst: 30
+  max_streams_per_ip: 4
+  max_events_per_ip: 8
+  trusted_proxy_cidrs: ["172.16.0.0/12"]
+  client_ip_headers: ["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]
+  schedule_interval: 1m
+  stream_chunk_window: 480ms
+  stream_buffer_window: 2s
+  stream_write_timeout: 5s
+
+suno:
+  sync_interval: 30m
+  http_timeout: 30s
+  max_audio_bytes: 134217728
+  max_cover_bytes: 16777216
+
+worker:
+  inbox_dir: ""
+  rescan_interval: 30s

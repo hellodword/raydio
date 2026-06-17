@@ -1,0 +1,10 @@
+.git
+.devcontainer
+tmp
+data
+config.yaml
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+coverage.out

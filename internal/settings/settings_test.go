@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -187,6 +188,33 @@ radios:
 	}
 	if cfg.Suno.MaxCoverBytes != 16*1024*1024 {
 		t.Fatalf("Suno.MaxCoverBytes = %d", cfg.Suno.MaxCoverBytes)
+	}
+}
+
+func TestLoadDockerConfig(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	path := filepath.Join(filepath.Dir(file), "..", "..", "config.docker.yaml")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DataDir != "/srv/raydio/data" {
+		t.Fatalf("DataDir = %q", cfg.DataDir)
+	}
+	if cfg.Server.Addr != ":8080" {
+		t.Fatalf("Server.Addr = %q", cfg.Server.Addr)
+	}
+	if strings.Join(cfg.Server.TrustedProxyCIDRs, ",") != "172.16.0.0/12" {
+		t.Fatalf("Server.TrustedProxyCIDRs = %+v", cfg.Server.TrustedProxyCIDRs)
+	}
+	if strings.Join(cfg.Server.ClientIPHeaders, ",") != "CF-Connecting-IP,X-Forwarded-For,X-Real-IP" {
+		t.Fatalf("Server.ClientIPHeaders = %+v", cfg.Server.ClientIPHeaders)
+	}
+	if len(cfg.Radios) == 0 {
+		t.Fatal("Radios is empty")
 	}
 }
 
