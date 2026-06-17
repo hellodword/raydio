@@ -23,6 +23,9 @@ type Scheduler struct {
 	bag         []string
 	lastTrack   string
 	rng         *rand.Rand
+	tracks      trackSet
+	catalogRev  store.CatalogRevision
+	tracksReady bool
 }
 
 type trackSet struct {
@@ -206,17 +209,15 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 	if start < now.UnixMilli() {
 		start = now.UnixMilli()
 	}
-	tracks, err := s.store.ListActiveTracks(ctx)
+	set, err := s.activeTrackSet(ctx)
 	if err != nil {
 		return err
 	}
-	set := newTrackSet(tracks)
+	slots := []store.Slot{}
 	for start < targetEnd {
 		if len(set.ids) == 0 {
 			slot := s.makeSilenceSlot(start, s.gapFrames, "empty")
-			if err := s.store.UpsertSlot(ctx, slot); err != nil {
-				return err
-			}
+			slots = append(slots, slot)
 			start = slot.EndUnixMs
 			continue
 		}
@@ -229,17 +230,32 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 			IsSilence:   false,
 			FrameCount:  t.FrameCount,
 		}
-		if err := s.store.UpsertSlot(ctx, trackSlot); err != nil {
-			return err
-		}
+		slots = append(slots, trackSlot)
 		start = trackSlot.EndUnixMs
 		gap := s.makeSilenceSlot(start, s.gapFrames, "gap")
-		if err := s.store.UpsertSlot(ctx, gap); err != nil {
-			return err
-		}
+		slots = append(slots, gap)
 		start = gap.EndUnixMs
 	}
-	return nil
+	return s.store.UpsertSlots(ctx, slots)
+}
+
+func (s *Scheduler) activeTrackSet(ctx context.Context) (trackSet, error) {
+	rev, err := s.store.CatalogRevision(ctx)
+	if err != nil {
+		return trackSet{}, err
+	}
+	if s.tracksReady && rev == s.catalogRev {
+		return s.tracks, nil
+	}
+	tracks, err := s.store.ListActiveTracks(ctx)
+	if err != nil {
+		return trackSet{}, err
+	}
+	s.tracks = newTrackSet(tracks)
+	s.catalogRev = rev
+	s.tracksReady = true
+	s.bag = nil
+	return s.tracks, nil
 }
 
 func (s *Scheduler) makeSilenceSlot(startMs int64, frames int64, prefix string) store.Slot {

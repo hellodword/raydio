@@ -127,7 +127,7 @@ Supported keys:
 | `log_level` | `DEBUG` | Minimum structured log level for both binaries. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
-| `server.stream_chunk_window` | `240ms` | Shared audio chunk size produced once and fanned out to listeners. |
+| `server.stream_chunk_window` | `480ms` | Shared audio chunk size produced once and fanned out to listeners. |
 | `server.stream_buffer_window` | `2s` | Live catch-up window for slow listeners. |
 | `server.stream_write_timeout` | `5s` | Maximum blocking time for a listener write. |
 | `worker.inbox_dir` | empty | Source MP3 directory. Empty means `<data_dir>/inbox`. |
@@ -197,10 +197,15 @@ Lyrics use LRC timestamps, for example:
 | `GET /radio` | Infinite MP3 stream. |
 | `GET /api/now` | Current server time, slot, track, elapsed time, and duration. |
 | `GET /api/events` | Server-Sent Events stream for track changes. |
-| `GET /api/catalog` | Current catalog state. |
+| `GET /api/catalog` | Paginated current catalog state. |
 | `GET /covers/{trackID}` | Cover asset for a track, when present. |
 | `GET /lyrics/{trackID}` | LRC lyric asset for a track, when present. |
 | `GET /healthz` | Plain `ok` health check. |
+
+`/api/catalog` is paginated. Use `limit` to request up to 500 tracks and pass
+the returned `nextCursor` as `cursor` to read the next page. Responses include
+`revision`, `tracks`, `nextCursor`, and `hasMore`, and support `ETag`
+revalidation.
 
 `/radio` sends:
 
@@ -391,7 +396,7 @@ log_level: DEBUG
 server:
   addr: "127.0.0.1:18080"
   schedule_interval: 1m
-  stream_chunk_window: 240ms
+  stream_chunk_window: 480ms
   stream_buffer_window: 2s
   stream_write_timeout: 5s
 worker:

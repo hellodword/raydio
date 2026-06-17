@@ -36,7 +36,7 @@ type Engine struct {
 	slots     []store.Slot
 	tracks    map[string]store.Track
 	assetURLs map[string]map[string]string
-	catalog   []store.Track
+	assets    map[string]map[string]store.Asset
 
 	refreshMu sync.Mutex
 	refreshCh chan struct{}
@@ -51,6 +51,7 @@ type Engine struct {
 
 	currentFilePath string
 	currentFile     *os.File
+	fileMu          sync.Mutex
 }
 
 type AudioPacket struct {
@@ -98,6 +99,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		ring:          newAudioRing(capacity),
 		tracks:        map[string]store.Track{},
 		assetURLs:     map[string]map[string]string{},
+		assets:        map[string]map[string]store.Asset{},
 		refreshCh:     make(chan struct{}, 1),
 		eventSubs:     map[chan Now]struct{}{},
 	}
@@ -147,37 +149,36 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 		return nil
 	}
 
-	tracks, err := e.cfg.Store.ListTracks(ctx)
+	ids := trackIDsFromSlots(slots)
+	tracks, err := e.cfg.Store.TracksByID(ctx, ids)
 	if err != nil {
 		return err
 	}
-	assets, err := e.cfg.Store.ListAssets(ctx)
+	assets, err := e.cfg.Store.AssetsByTrackIDs(ctx, ids)
 	if err != nil {
 		return err
 	}
 
-	trackByID := make(map[string]store.Track, len(tracks))
-	for _, t := range tracks {
-		trackByID[t.ID] = t
-	}
-	urls := make(map[string]map[string]string)
-	for _, a := range assets {
-		if urls[a.TrackID] == nil {
-			urls[a.TrackID] = map[string]string{}
-		}
-		switch a.Kind {
-		case "cover":
-			urls[a.TrackID]["cover"] = "/covers/" + a.TrackID
-		case "lyrics":
-			urls[a.TrackID]["lyrics"] = "/lyrics/" + a.TrackID
+	urls := make(map[string]map[string]string, len(assets))
+	for trackID, byKind := range assets {
+		for _, a := range byKind {
+			if urls[trackID] == nil {
+				urls[trackID] = map[string]string{}
+			}
+			switch a.Kind {
+			case "cover":
+				urls[trackID]["cover"] = "/covers/" + trackID
+			case "lyrics":
+				urls[trackID]["lyrics"] = "/lyrics/" + trackID
+			}
 		}
 	}
 
 	e.stateMu.Lock()
 	e.slots = slots
-	e.tracks = trackByID
+	e.tracks = tracks
 	e.assetURLs = urls
-	e.catalog = append([]store.Track(nil), tracks...)
+	e.assets = assets
 	e.catalogRev = rev
 	e.catalogLoaded = true
 	e.stateMu.Unlock()
@@ -191,10 +192,14 @@ func (e *Engine) Now() Now {
 	return Now{ServerTimeMs: time.Now().UnixMilli()}
 }
 
-func (e *Engine) Catalog() []store.Track {
+func (e *Engine) Asset(trackID, kind string) (store.Asset, bool) {
 	e.stateMu.RLock()
 	defer e.stateMu.RUnlock()
-	return append([]store.Track(nil), e.catalog...)
+	if byKind := e.assets[trackID]; byKind != nil {
+		a, ok := byKind[kind]
+		return a, ok
+	}
+	return store.Asset{}, false
 }
 
 func (e *Engine) SubscribeEvents() (<-chan Now, func()) {
@@ -216,6 +221,10 @@ func (e *Engine) LiveSeq() int64 {
 
 func (e *Engine) WaitPacket(ctx context.Context, seq int64) (AudioPacket, int64, error) {
 	return e.ring.wait(ctx, seq)
+}
+
+func (e *Engine) RequestRefresh() {
+	e.requestRefresh()
 }
 
 func (e *Engine) refreshLoop(ctx context.Context) {
@@ -245,19 +254,55 @@ func (e *Engine) producerLoop(ctx context.Context) {
 	defer e.closeCurrentFile()
 	ticker := time.NewTicker(e.chunkDuration)
 	defer ticker.Stop()
-	for {
-		if err := e.publishTick(ctx, time.Now()); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			slog.Error("radio engine publish failed", "error", err)
+
+	at := time.Now()
+	if err := e.publishTick(ctx, at); err != nil {
+		if ctx.Err() != nil {
+			return
 		}
+		slog.Error("radio engine publish failed", "error", err)
+	}
+	readCh := e.prefetchAudio(ctx, at.Add(e.chunkDuration))
+	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 		}
+		var result audioReadResult
+		select {
+		case <-ctx.Done():
+			return
+		case result = <-readCh:
+		}
+		if result.err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("radio engine publish failed", "error", result.err)
+		} else if err := e.publishAudio(ctx, result.at, result.data); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("radio engine publish failed", "error", err)
+		}
+		readCh = e.prefetchAudio(ctx, result.at.Add(e.chunkDuration))
 	}
+}
+
+type audioReadResult struct {
+	at   time.Time
+	data []byte
+	err  error
+}
+
+func (e *Engine) prefetchAudio(ctx context.Context, at time.Time) <-chan audioReadResult {
+	ch := make(chan audioReadResult, 1)
+	go func() {
+		data, err := e.readAudio(ctx, at, e.chunkFrames)
+		ch <- audioReadResult{at: at, data: data, err: err}
+	}()
+	return ch
 }
 
 func (e *Engine) publishTick(ctx context.Context, now time.Time) error {
@@ -265,6 +310,10 @@ func (e *Engine) publishTick(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	return e.publishAudio(ctx, now, data)
+}
+
+func (e *Engine) publishAudio(ctx context.Context, now time.Time, data []byte) error {
 	if err := e.updateNow(ctx, now); err != nil {
 		return err
 	}
@@ -273,14 +322,15 @@ func (e *Engine) publishTick(ctx context.Context, now time.Time) error {
 }
 
 func (e *Engine) readAudio(ctx context.Context, now time.Time, frames int64) ([]byte, error) {
-	out := make([]byte, 0, frames*audio.FrameSize)
+	out := make([]byte, frames*audio.FrameSize)
 	cursor := now
 	remaining := frames
+	written := int64(0)
 	for remaining > 0 {
 		pos, err := e.position(ctx, cursor)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
-				return e.appendSilence(ctx, out, remaining)
+				return e.appendSilence(ctx, out, written, remaining)
 			}
 			return nil, err
 		}
@@ -298,11 +348,12 @@ func (e *Engine) readAudio(ctx context.Context, now time.Time, frames int64) ([]
 		if pos.track != nil {
 			path = pos.track.CachePath
 		}
-		b, err := e.readFrameRange(ctx, path, frameIndex, use)
-		if err != nil {
+		start := written * audio.FrameSize
+		end := start + use*audio.FrameSize
+		if err := e.readFrameRange(ctx, path, frameIndex, use, out[start:end]); err != nil {
 			return nil, err
 		}
-		out = append(out, b...)
+		written += use
 		remaining -= use
 		cursor = cursor.Add(frameDuration(use))
 	}
@@ -427,7 +478,7 @@ func hasUnknownTrack(slots []store.Slot, tracks map[string]store.Track) bool {
 	return false
 }
 
-func (e *Engine) appendSilence(ctx context.Context, out []byte, frames int64) ([]byte, error) {
+func (e *Engine) appendSilence(ctx context.Context, out []byte, written, frames int64) ([]byte, error) {
 	silenceFrames := e.cfg.Scheduler.gapFrames
 	if silenceFrames <= 0 {
 		silenceFrames = frames
@@ -435,52 +486,54 @@ func (e *Engine) appendSilence(ctx context.Context, out []byte, frames int64) ([
 	remaining := frames
 	for remaining > 0 {
 		use := minInt64(remaining, silenceFrames)
-		b, err := e.readFrameRange(ctx, e.cfg.SilencePath, 0, use)
-		if err != nil {
+		start := written * audio.FrameSize
+		end := start + use*audio.FrameSize
+		if err := e.readFrameRange(ctx, e.cfg.SilencePath, 0, use, out[start:end]); err != nil {
 			return nil, err
 		}
-		out = append(out, b...)
+		written += use
 		remaining -= use
 	}
 	return out, nil
 }
 
-func (e *Engine) readFrameRange(ctx context.Context, path string, frameIndex, frames int64) ([]byte, error) {
+func (e *Engine) readFrameRange(ctx context.Context, path string, frameIndex, frames int64, dst []byte) error {
+	e.fileMu.Lock()
+	defer e.fileMu.Unlock()
 	f, err := e.openCurrentFile(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := f.Seek(frameIndex*audio.FrameSize, io.SeekStart); err != nil {
-		return nil, err
+		return err
 	}
 	length := frames * audio.FrameSize
-	buf := make([]byte, length)
 	offset := int64(0)
 	for offset < length {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return ctx.Err()
 		default:
 		}
-		n, err := f.Read(buf[offset:])
+		n, err := f.Read(dst[offset:])
 		if n > 0 {
 			offset += int64(n)
 		}
 		if errors.Is(err, io.EOF) && offset == length {
-			return buf, nil
+			return nil
 		}
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-	return buf, nil
+	return nil
 }
 
 func (e *Engine) openCurrentFile(path string) (*os.File, error) {
 	if e.currentFile != nil && e.currentFilePath == path {
 		return e.currentFile, nil
 	}
-	e.closeCurrentFile()
+	e.closeCurrentFileLocked()
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -491,6 +544,12 @@ func (e *Engine) openCurrentFile(path string) (*os.File, error) {
 }
 
 func (e *Engine) closeCurrentFile() {
+	e.fileMu.Lock()
+	defer e.fileMu.Unlock()
+	e.closeCurrentFileLocked()
+}
+
+func (e *Engine) closeCurrentFileLocked() {
 	if e.currentFile != nil {
 		_ = e.currentFile.Close()
 		e.currentFile = nil
@@ -520,53 +579,56 @@ func frameDuration(frames int64) time.Duration {
 type audioRing struct {
 	mu       sync.Mutex
 	notify   chan struct{}
-	packets  []AudioPacket
-	nextSeq  int64
+	packets  []atomic.Value
+	nextSeq  atomic.Int64
 	capacity int
 }
 
 func newAudioRing(capacity int) *audioRing {
 	return &audioRing{
 		notify:   make(chan struct{}),
-		packets:  make([]AudioPacket, capacity),
+		packets:  make([]atomic.Value, capacity),
 		capacity: capacity,
 	}
 }
 
 func (r *audioRing) publish(data []byte) {
+	seq := r.nextSeq.Load()
+	r.packets[int(seq%int64(r.capacity))].Store(AudioPacket{Seq: seq, Data: data})
 	r.mu.Lock()
-	seq := r.nextSeq
-	r.packets[int(seq%int64(r.capacity))] = AudioPacket{Seq: seq, Data: data}
-	r.nextSeq++
+	r.nextSeq.Store(seq + 1)
 	close(r.notify)
 	r.notify = make(chan struct{})
 	r.mu.Unlock()
 }
 
 func (r *audioRing) liveSeq() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.nextSeq == 0 {
+	next := r.nextSeq.Load()
+	if next == 0 {
 		return 0
 	}
-	return r.nextSeq - 1
+	return next - 1
 }
 
 func (r *audioRing) wait(ctx context.Context, seq int64) (AudioPacket, int64, error) {
 	for {
-		r.mu.Lock()
-		oldest := r.nextSeq - int64(r.capacity)
-		if oldest < 0 {
-			oldest = 0
-		}
-		if seq < oldest {
-			seq = oldest
-		}
-		if seq < r.nextSeq {
-			p := r.packets[int(seq%int64(r.capacity))]
+		nextSeq := r.nextSeq.Load()
+		if p, ok := r.packet(seq, nextSeq); ok {
 			next := p.Seq + 1
-			r.mu.Unlock()
 			return p, next, nil
+		}
+		seq = clampSeq(seq, nextSeq, r.capacity)
+
+		r.mu.Lock()
+		nextSeq = r.nextSeq.Load()
+		seq = clampSeq(seq, nextSeq, r.capacity)
+		if _, ok := r.packet(seq, nextSeq); ok {
+			r.mu.Unlock()
+			continue
+		}
+		if seq < nextSeq {
+			r.mu.Unlock()
+			continue
 		}
 		notify := r.notify
 		r.mu.Unlock()
@@ -580,11 +642,46 @@ func (r *audioRing) wait(ctx context.Context, seq int64) (AudioPacket, int64, er
 }
 
 func (r *audioRing) len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	n := r.nextSeq
+	n := r.nextSeq.Load()
 	if n > int64(r.capacity) {
 		return r.capacity
 	}
 	return int(n)
+}
+
+func (r *audioRing) packet(seq, nextSeq int64) (AudioPacket, bool) {
+	seq = clampSeq(seq, nextSeq, r.capacity)
+	if seq >= nextSeq {
+		return AudioPacket{}, false
+	}
+	v := r.packets[int(seq%int64(r.capacity))].Load()
+	if v == nil {
+		return AudioPacket{}, false
+	}
+	p := v.(AudioPacket)
+	if p.Seq != seq {
+		return AudioPacket{}, false
+	}
+	return p, true
+}
+
+func clampSeq(seq, nextSeq int64, capacity int) int64 {
+	oldest := nextSeq - int64(capacity)
+	if oldest < 0 {
+		oldest = 0
+	}
+	if seq < oldest {
+		return oldest
+	}
+	return seq
+}
+
+func trackIDsFromSlots(slots []store.Slot) []string {
+	ids := make([]string, 0, len(slots))
+	for _, slot := range slots {
+		if slot.TrackID.Valid {
+			ids = append(ids, slot.TrackID.String)
+		}
+	}
+	return ids
 }

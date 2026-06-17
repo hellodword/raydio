@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -12,7 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -38,10 +41,26 @@ type config struct {
 }
 
 type app struct {
-	cfg    config
-	store  *store.Store
-	engine *radio.Engine
+	cfg      config
+	store    *store.Store
+	engine   *radio.Engine
+	webFiles map[string]webFile
 }
+
+type webFile struct {
+	Data        []byte
+	ContentType string
+	ETag        string
+	ModTime     time.Time
+}
+
+const (
+	defaultCatalogLimit   = 100
+	maxCatalogLimit       = 500
+	minStreamChunkWindow  = 120 * time.Millisecond
+	maxStreamChunkWindow  = 2 * time.Second
+	maxStreamBufferWindow = 30 * time.Second
+)
 
 func main() {
 	cfg, err := readConfig(os.Args[1:])
@@ -137,7 +156,11 @@ func run(ctx context.Context, cfg config) error {
 	}
 	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
 
-	a := &app{cfg: cfg, store: st, engine: engine}
+	webFiles, err := loadWebFiles()
+	if err != nil {
+		return err
+	}
+	a := &app{cfg: cfg, store: st, engine: engine, webFiles: webFiles}
 
 	mux := http.NewServeMux()
 	a.routes(mux)
@@ -173,8 +196,20 @@ func validateConfig(cfg config) error {
 	if cfg.StreamChunkWindow <= 0 {
 		return fmt.Errorf("stream chunk window must be positive")
 	}
+	if cfg.StreamChunkWindow < minStreamChunkWindow {
+		return fmt.Errorf("stream chunk window must be at least %s", minStreamChunkWindow)
+	}
+	if cfg.StreamChunkWindow > maxStreamChunkWindow {
+		return fmt.Errorf("stream chunk window must be at most %s", maxStreamChunkWindow)
+	}
 	if cfg.StreamBufferWindow <= 0 {
 		return fmt.Errorf("stream buffer window must be positive")
+	}
+	if cfg.StreamBufferWindow < cfg.StreamChunkWindow {
+		return fmt.Errorf("stream buffer window must be greater than or equal to stream chunk window")
+	}
+	if cfg.StreamBufferWindow > maxStreamBufferWindow {
+		return fmt.Errorf("stream buffer window must be at most %s", maxStreamBufferWindow)
 	}
 	if cfg.StreamWriteTimeout <= 0 {
 		return fmt.Errorf("stream write timeout must be positive")
@@ -213,14 +248,18 @@ func (a *app) static(name, contentType string) http.HandlerFunc {
 }
 
 func (a *app) serveWebFile(w http.ResponseWriter, r *http.Request, name, contentType string) {
-	b, err := web.FS.ReadFile(name)
-	if err != nil {
+	f, ok := a.webFiles[name]
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", contentType)
+	if contentType != "" {
+		f.ContentType = contentType
+	}
+	w.Header().Set("Content-Type", f.ContentType)
 	w.Header().Set("Cache-Control", "public, max-age=300")
-	http.ServeContent(w, r, name, time.Now(), strings.NewReader(string(b)))
+	w.Header().Set("ETag", f.ETag)
+	http.ServeContent(w, r, name, f.ModTime, bytes.NewReader(f.Data))
 }
 
 func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
@@ -326,13 +365,58 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, map[string]any{"tracks": a.engine.Catalog()})
+	limit, err := parseCatalogLimit(r.URL.Query().Get("limit"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	afterTitle, afterID, err := decodeCatalogCursor(r.URL.Query().Get("cursor"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	rev, err := a.store.CatalogRevision(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	etag := catalogETag(rev, limit, r.URL.Query().Get("cursor"))
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, no-cache")
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	tracks, err := a.store.ListCatalogPage(r.Context(), afterTitle, afterID, limit+1)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	hasMore := len(tracks) > limit
+	if hasMore {
+		tracks = tracks[:limit]
+	}
+	nextCursor := ""
+	if hasMore && len(tracks) > 0 {
+		last := tracks[len(tracks)-1]
+		nextCursor = encodeCatalogCursor(last.Title, last.ID)
+	}
+	writeJSON(w, map[string]any{
+		"revision":   rev.Revision,
+		"tracks":     tracks,
+		"nextCursor": nextCursor,
+		"hasMore":    hasMore,
+	})
 }
 
 func (a *app) handleAsset(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		a, err := a.store.Asset(r.Context(), id, kind)
+		if asset, ok := a.engine.Asset(id, kind); ok {
+			serveAsset(w, r, asset)
+			return
+		}
+		asset, err := a.store.Asset(r.Context(), id, kind)
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
@@ -341,9 +425,8 @@ func (a *app) handleAsset(kind string) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", a.MIME)
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		http.ServeFile(w, r, a.Path)
+		a.engine.RequestRefresh()
+		serveAsset(w, r, asset)
 	}
 }
 
@@ -354,8 +437,83 @@ func (a *app) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
+	if w.Header().Get("Cache-Control") == "" {
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+}
+
+func loadWebFiles() (map[string]webFile, error) {
+	files := map[string]string{
+		"index.html": "text/html; charset=utf-8",
+		"app.js":     "application/javascript; charset=utf-8",
+		"styles.css": "text/css; charset=utf-8",
+	}
+	out := make(map[string]webFile, len(files))
+	for name, contentType := range files {
+		data, err := web.FS.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		sum := sha256.Sum256(data)
+		out[name] = webFile{
+			Data:        data,
+			ContentType: contentType,
+			ETag:        `"` + base64.RawURLEncoding.EncodeToString(sum[:]) + `"`,
+			ModTime:     time.Unix(0, 0).UTC(),
+		}
+	}
+	return out, nil
+}
+
+func serveAsset(w http.ResponseWriter, r *http.Request, a store.Asset) {
+	w.Header().Set("Content-Type", a.MIME)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeFile(w, r, a.Path)
+}
+
+func parseCatalogLimit(raw string) (int, error) {
+	if raw == "" {
+		return defaultCatalogLimit, nil
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("limit must be a positive integer")
+	}
+	if n > maxCatalogLimit {
+		return maxCatalogLimit, nil
+	}
+	return n, nil
+}
+
+func encodeCatalogCursor(title, id string) string {
+	b, _ := json.Marshal(struct {
+		Title string `json:"title"`
+		ID    string `json:"id"`
+	}{Title: title, ID: id})
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func decodeCatalogCursor(raw string) (string, string, error) {
+	if raw == "" {
+		return "", "", nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid cursor")
+	}
+	var cursor struct {
+		Title string `json:"title"`
+		ID    string `json:"id"`
+	}
+	if err := json.Unmarshal(b, &cursor); err != nil || cursor.ID == "" {
+		return "", "", fmt.Errorf("invalid cursor")
+	}
+	return cursor.Title, cursor.ID, nil
+}
+
+func catalogETag(rev store.CatalogRevision, limit int, cursor string) string {
+	sum := sha256.Sum256([]byte(cursor))
+	return fmt.Sprintf(`"catalog-%d-%d-%x"`, rev.Revision, limit, sum[:6])
 }

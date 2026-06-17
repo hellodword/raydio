@@ -103,7 +103,7 @@ func TestCatalogRevisionChangesWithTracksAndAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if withTrack == empty || withTrack.TrackCount != 1 {
+	if withTrack.Revision <= empty.Revision {
 		t.Fatalf("track revision did not change: empty=%+v withTrack=%+v", empty, withTrack)
 	}
 
@@ -115,8 +115,50 @@ func TestCatalogRevisionChangesWithTracksAndAssets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if withAsset == withTrack || withAsset.AssetCount != 1 {
+	if withAsset.Revision <= withTrack.Revision {
 		t.Fatalf("asset revision did not change: withTrack=%+v withAsset=%+v", withTrack, withAsset)
+	}
+}
+
+func TestListCatalogPageReturnsPublicFieldsAndAssetURLs(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	tracks := []Track{
+		{ID: "ccc", SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "aaa", SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "bbb", SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+	}
+	for _, track := range tracks {
+		if err := st.UpsertTrack(ctx, track); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertAsset(ctx, Asset{TrackID: "bbb", Kind: "cover", Path: "/cache/b.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := st.ListCatalogPage(ctx, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 2 || first[0].ID != "aaa" || first[1].ID != "bbb" {
+		t.Fatalf("first page = %+v", first)
+	}
+	if first[1].CoverURL != "/covers/bbb" {
+		t.Fatalf("cover URL = %q", first[1].CoverURL)
+	}
+
+	next, err := st.ListCatalogPage(ctx, first[1].Title, first[1].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next) != 1 || next[0].ID != "ccc" {
+		t.Fatalf("next page = %+v", next)
 	}
 }
 
@@ -139,6 +181,23 @@ func TestMigrationCreatesPerformanceIndexes(t *testing.T) {
 		}
 		if count != 1 {
 			t.Fatalf("index %s count = %d, want 1", name, count)
+		}
+	}
+
+	for _, name := range []string{
+		"trg_tracks_catalog_revision_insert",
+		"trg_tracks_catalog_revision_update",
+		"trg_tracks_catalog_revision_delete",
+		"trg_track_assets_catalog_revision_insert",
+		"trg_track_assets_catalog_revision_update",
+		"trg_track_assets_catalog_revision_delete",
+	} {
+		var count int
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name=?`, name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("trigger %s count = %d, want 1", name, count)
 		}
 	}
 }

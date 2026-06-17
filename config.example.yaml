@@ -25,8 +25,8 @@ server:
   schedule_interval: 1m
 
   # Shared audio chunk size produced once by the main service and fanned out to listeners.
-  # 240ms is 10 MP3 frames at 48 kHz.
-  stream_chunk_window: 240ms
+  # 480ms is 20 MP3 frames at 48 kHz.
+  stream_chunk_window: 480ms
 
   # Per-listener live catch-up window. Slow listeners skip old chunks after this window.
   stream_buffer_window: 2s

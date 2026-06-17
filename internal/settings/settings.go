@@ -41,7 +41,7 @@ func Defaults() File {
 		Server: Server{
 			Addr:               ":8080",
 			ScheduleInterval:   time.Minute,
-			StreamChunkWindow:  240 * time.Millisecond,
+			StreamChunkWindow:  480 * time.Millisecond,
 			StreamBufferWindow: 2 * time.Second,
 			StreamWriteTimeout: 5 * time.Second,
 		},

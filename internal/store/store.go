@@ -23,10 +23,18 @@ type Store struct {
 }
 
 type CatalogRevision struct {
-	TrackCount     int64
-	TrackUpdatedAt string
-	AssetCount     int64
-	AssetUpdatedAt string
+	Revision  int64
+	UpdatedAt string
+}
+
+type CatalogTrack struct {
+	ID         string `json:"id"`
+	Title      string `json:"title"`
+	Artist     string `json:"artist"`
+	Album      string `json:"album,omitempty"`
+	DurationMs int64  `json:"durationMs"`
+	CoverURL   string `json:"coverUrl,omitempty"`
+	LyricsURL  string `json:"lyricsUrl,omitempty"`
 }
 
 type Track struct {
@@ -177,6 +185,42 @@ func (s *Store) Migrate(ctx context.Context) error {
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS catalog_state (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			revision INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL DEFAULT ''
+		)`,
+		`INSERT OR IGNORE INTO catalog_state(id, revision, updated_at) VALUES (1, 0, datetime('now'))`,
+		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_insert
+			AFTER INSERT ON tracks
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_update
+			AFTER UPDATE ON tracks
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_delete
+			AFTER DELETE ON tracks
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_insert
+			AFTER INSERT ON track_assets
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_update
+			AFTER UPDATE ON track_assets
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_delete
+			AFTER DELETE ON track_assets
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
+			END`,
 		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))`,
 	}
 	for _, stmt := range schema {
@@ -303,12 +347,8 @@ func (s *Store) ListAssets(ctx context.Context) ([]Asset, error) {
 
 func (s *Store) CatalogRevision(ctx context.Context) (CatalogRevision, error) {
 	var rev CatalogRevision
-	err := s.db.QueryRowContext(ctx, `SELECT
-		(SELECT COUNT(*) FROM tracks),
-		(SELECT COALESCE(MAX(updated_at), '') FROM tracks),
-		(SELECT COUNT(*) FROM track_assets),
-		(SELECT COALESCE(MAX(updated_at), '') FROM track_assets)`,
-	).Scan(&rev.TrackCount, &rev.TrackUpdatedAt, &rev.AssetCount, &rev.AssetUpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT revision, updated_at FROM catalog_state WHERE id=1`).
+		Scan(&rev.Revision, &rev.UpdatedAt)
 	if err != nil {
 		return CatalogRevision{}, err
 	}
@@ -360,6 +400,98 @@ func (s *Store) ListActiveTracks(ctx context.Context) ([]Track, error) {
 
 func (s *Store) ListTracks(ctx context.Context) ([]Track, error) {
 	return s.listTracks(ctx, `ORDER BY title COLLATE NOCASE, id`)
+}
+
+func (s *Store) ListCatalogPage(ctx context.Context, afterTitle, afterID string, limit int) ([]CatalogTrack, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT
+			t.id, t.title, t.artist, t.album, t.duration_ms,
+			EXISTS(SELECT 1 FROM track_assets a WHERE a.track_id=t.id AND a.kind='cover'),
+			EXISTS(SELECT 1 FROM track_assets a WHERE a.track_id=t.id AND a.kind='lyrics')
+		FROM tracks t
+		WHERE t.status=?
+			AND ((?='' AND ?='') OR t.title COLLATE NOCASE > ? COLLATE NOCASE
+				OR (t.title COLLATE NOCASE = ? COLLATE NOCASE AND t.id > ?))
+		ORDER BY t.title COLLATE NOCASE, t.id
+		LIMIT ?`,
+		TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []CatalogTrack
+	for rows.Next() {
+		var t CatalogTrack
+		var hasCover, hasLyrics int
+		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationMs, &hasCover, &hasLyrics); err != nil {
+			return nil, err
+		}
+		if hasCover != 0 {
+			t.CoverURL = "/covers/" + t.ID
+		}
+		if hasLyrics != 0 {
+			t.LyricsURL = "/lyrics/" + t.ID
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) TracksByID(ctx context.Context, ids []string) (map[string]Track, error) {
+	unique := uniqueStrings(ids)
+	out := make(map[string]Track, len(unique))
+	if len(unique) == 0 {
+		return out, nil
+	}
+	args := make([]any, 0, len(unique))
+	for _, id := range unique {
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, selectTracksSQL()+` WHERE id IN (`+QuotePlaceholders(len(unique))+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		t, err := scanTrack(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[t.ID] = t
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AssetsByTrackIDs(ctx context.Context, ids []string) (map[string]map[string]Asset, error) {
+	unique := uniqueStrings(ids)
+	out := make(map[string]map[string]Asset, len(unique))
+	if len(unique) == 0 {
+		return out, nil
+	}
+	args := make([]any, 0, len(unique))
+	for _, id := range unique {
+		args = append(args, id)
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT track_id, kind, path, mime
+		FROM track_assets WHERE track_id IN (`+QuotePlaceholders(len(unique))+`)`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var a Asset
+		if err := rows.Scan(&a.TrackID, &a.Kind, &a.Path, &a.MIME); err != nil {
+			return nil, err
+		}
+		if out[a.TrackID] == nil {
+			out[a.TrackID] = map[string]Asset{}
+		}
+		out[a.TrackID][a.Kind] = a
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) Track(ctx context.Context, id string) (Track, error) {
@@ -436,6 +568,37 @@ func (s *Store) UpsertSlot(ctx context.Context, sl Slot) error {
 			frame_count=excluded.frame_count`,
 		sl.ID, sl.StartUnixMs, sl.EndUnixMs, nullableString(sl.TrackID), boolInt(sl.IsSilence), sl.FrameCount, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
+}
+
+func (s *Store) UpsertSlots(ctx context.Context, slots []Slot) error {
+	if len(slots) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO schedule_slots(id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			start_unix_ms=excluded.start_unix_ms,
+			end_unix_ms=excluded.end_unix_ms,
+			track_id=excluded.track_id,
+			is_silence=excluded.is_silence,
+			frame_count=excluded.frame_count`)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	defer stmt.Close()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, sl := range slots {
+		if _, err := stmt.ExecContext(ctx, sl.ID, sl.StartUnixMs, sl.EndUnixMs, nullableString(sl.TrackID), boolInt(sl.IsSilence), sl.FrameCount, now); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SlotsEndingAfter(ctx context.Context, unixMs int64) ([]Slot, error) {
@@ -520,4 +683,23 @@ func QuotePlaceholders(n int) string {
 		return ""
 	}
 	return strings.TrimRight(strings.Repeat("?,", n), ",")
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }

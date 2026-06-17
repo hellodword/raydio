@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,7 +97,7 @@ func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
 		CacheDir:           layout.CacheDir,
 		DBPath:             layout.DBPath,
 		ScheduleInterval:   time.Second,
-		StreamChunkWindow:  24 * time.Millisecond,
+		StreamChunkWindow:  minStreamChunkWindow,
 		StreamBufferWindow: time.Second,
 		StreamWriteTimeout: time.Second,
 		GapFrames:          5,
@@ -131,7 +134,7 @@ func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
 			CacheDir:           layout.CacheDir,
 			DBPath:             layout.DBPath,
 			ScheduleInterval:   5 * time.Millisecond,
-			StreamChunkWindow:  24 * time.Millisecond,
+			StreamChunkWindow:  minStreamChunkWindow,
 			StreamBufferWindow: time.Second,
 			StreamWriteTimeout: time.Second,
 			GapFrames:          5,
@@ -185,6 +188,100 @@ func TestEngineStartMaintainsFutureSlots(t *testing.T) {
 		slots, err := st.SlotsEndingAfter(ctx, time.Now().UnixMilli())
 		return err == nil && len(slots) > 0
 	})
+}
+
+func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for _, track := range []store.Track{
+		{ID: "aaa", SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+		{ID: "bbb", SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+		{ID: "ccc", SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+	} {
+		if err := st.UpsertTrack(ctx, track); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertAsset(ctx, store.Asset{TrackID: "bbb", Kind: "cover", Path: "/cache/b.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &app{store: st}
+	req := httptest.NewRequest(http.MethodGet, "/api/catalog?limit=2", nil)
+	rr := httptest.NewRecorder()
+	a.handleCatalog(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if strings.Contains(rr.Body.String(), "cachePath") || strings.Contains(rr.Body.String(), "sourcePath") {
+		t.Fatalf("catalog exposed internal paths: %s", rr.Body.String())
+	}
+	var page struct {
+		Revision   int64                `json:"revision"`
+		Tracks     []store.CatalogTrack `json:"tracks"`
+		NextCursor string               `json:"nextCursor"`
+		HasMore    bool                 `json:"hasMore"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if page.Revision == 0 || len(page.Tracks) != 2 || !page.HasMore || page.NextCursor == "" {
+		t.Fatalf("page = %+v", page)
+	}
+	if page.Tracks[1].CoverURL != "/covers/bbb" {
+		t.Fatalf("cover URL = %q", page.Tracks[1].CoverURL)
+	}
+
+	etag := rr.Header().Get("ETag")
+	req = httptest.NewRequest(http.MethodGet, "/api/catalog?limit=2", nil)
+	req.Header.Set("If-None-Match", etag)
+	rr = httptest.NewRecorder()
+	a.handleCatalog(rr, req)
+	if rr.Code != http.StatusNotModified {
+		t.Fatalf("etag status = %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/catalog?limit=2&cursor="+page.NextCursor, nil)
+	rr = httptest.NewRecorder()
+	a.handleCatalog(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("next status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var next struct {
+		Tracks  []store.CatalogTrack `json:"tracks"`
+		HasMore bool                 `json:"hasMore"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &next); err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Tracks) != 1 || next.Tracks[0].ID != "ccc" || next.HasMore {
+		t.Fatalf("next page = %+v", next)
+	}
+}
+
+func TestServeWebFileUsesPreloadedBytesAndETag(t *testing.T) {
+	files, err := loadWebFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app{webFiles: files}
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	a.serveWebFile(rr, req, "index.html", "text/html; charset=utf-8")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if rr.Header().Get("ETag") == "" {
+		t.Fatal("missing ETag")
+	}
+	if !strings.Contains(rr.Body.String(), "<!doctype html>") {
+		t.Fatalf("unexpected body prefix: %.40q", rr.Body.String())
+	}
 }
 
 func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {

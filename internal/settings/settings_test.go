@@ -89,7 +89,7 @@ server:
 	if cfg.Server.ScheduleInterval != time.Minute {
 		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
 	}
-	if cfg.Server.StreamChunkWindow != 240*time.Millisecond {
+	if cfg.Server.StreamChunkWindow != 480*time.Millisecond {
 		t.Fatalf("Server.StreamChunkWindow = %s", cfg.Server.StreamChunkWindow)
 	}
 	if cfg.Server.StreamBufferWindow != 2*time.Second {

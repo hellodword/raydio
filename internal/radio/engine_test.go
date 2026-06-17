@@ -101,13 +101,18 @@ func TestEngineRefreshSkipsCatalogReloadWhenRevisionUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.stateMu.Lock()
-	e.catalog[0].Title = "Sentinel"
+	sentinel := e.tracks[track.ID]
+	sentinel.Title = "Sentinel"
+	e.tracks[track.ID] = sentinel
 	e.stateMu.Unlock()
 
 	if err := e.Refresh(ctx, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.Catalog()[0].Title; got != "Sentinel" {
+	e.stateMu.RLock()
+	got := e.tracks[track.ID].Title
+	e.stateMu.RUnlock()
+	if got != "Sentinel" {
 		t.Fatalf("catalog reloaded despite stable revision, title = %q", got)
 	}
 
@@ -119,8 +124,61 @@ func TestEngineRefreshSkipsCatalogReloadWhenRevisionUnchanged(t *testing.T) {
 	if err := e.Refresh(ctx, now.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if got := e.Catalog()[0].Title; got != "B" {
+	e.stateMu.RLock()
+	got = e.tracks[track.ID].Title
+	e.stateMu.RUnlock()
+	if got != "B" {
 		t.Fatalf("catalog did not reload after revision change, title = %q", got)
+	}
+}
+
+func TestEngineRefreshCachesScheduledAssets(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	track := store.Track{
+		ID:            "abcdef1234567890",
+		SourcePath:    "/inbox/a.mp3",
+		CachePath:     "/cache/a.mp3",
+		Title:         "A",
+		Artist:        "Artist",
+		DurationMs:    2400,
+		FrameCount:    100,
+		FrameSize:     576,
+		Bitrate:       192000,
+		SampleRate:    48000,
+		Channels:      2,
+		Status:        store.TrackStatusActive,
+		SourceModUnix: 1,
+	}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAsset(ctx, store.Asset{TrackID: track.ID, Kind: "cover", Path: "/cache/a.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewEngine(EngineConfig{
+		Scheduler:          NewScheduler(st, "/cache/silence.mp3", 5),
+		Store:              st,
+		SilencePath:        "/cache/silence.mp3",
+		RefreshInterval:    time.Minute,
+		StreamChunkWindow:  frameDuration(1),
+		StreamBufferWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Refresh(ctx, time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	asset, ok := e.Asset(track.ID, "cover")
+	if !ok || asset.Path != "/cache/a.jpg" {
+		t.Fatalf("cached asset = %+v ok=%v", asset, ok)
 	}
 }
 
