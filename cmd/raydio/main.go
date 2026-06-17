@@ -24,13 +24,14 @@ import (
 )
 
 type config struct {
-	Addr           string
-	DataDir        string
-	InboxDir       string
-	CacheDir       string
-	DBPath         string
-	RescanInterval time.Duration
-	GapFrames      int64
+	Addr             string
+	DataDir          string
+	InboxDir         string
+	CacheDir         string
+	DBPath           string
+	RescanInterval   time.Duration
+	ScheduleInterval time.Duration
+	GapFrames        int64
 }
 
 type app struct {
@@ -56,6 +57,7 @@ func readConfig() config {
 	flag.StringVar(&cfg.DataDir, "data", env("RAYDIO_DATA", "./data"), "data directory")
 	flag.StringVar(&cfg.InboxDir, "inbox", env("RAYDIO_INBOX", ""), "inbox directory")
 	flag.DurationVar(&cfg.RescanInterval, "rescan", envDuration("RAYDIO_RESCAN", 30*time.Second), "rescan interval")
+	flag.DurationVar(&cfg.ScheduleInterval, "schedule", envDuration("RAYDIO_SCHEDULE", time.Minute), "schedule maintenance interval")
 	flag.Int64Var(&cfg.GapFrames, "gap-frames", envInt64("RAYDIO_GAP_FRAMES", 209), "silence gap frame count")
 	flag.Parse()
 	if cfg.InboxDir == "" {
@@ -67,6 +69,9 @@ func readConfig() config {
 }
 
 func run(ctx context.Context, cfg config) error {
+	if err := validateConfig(cfg); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
@@ -91,6 +96,7 @@ func run(ctx context.Context, cfg config) error {
 
 	a := &app{cfg: cfg, store: st, catalog: cat, scheduler: scheduler}
 	go a.scanLoop(ctx)
+	go a.scheduleLoop(ctx)
 
 	mux := http.NewServeMux()
 	a.routes(mux)
@@ -119,6 +125,19 @@ func run(ctx context.Context, cfg config) error {
 	}
 }
 
+func validateConfig(cfg config) error {
+	if cfg.RescanInterval <= 0 {
+		return fmt.Errorf("rescan interval must be positive")
+	}
+	if cfg.ScheduleInterval <= 0 {
+		return fmt.Errorf("schedule interval must be positive")
+	}
+	if cfg.GapFrames <= 0 {
+		return fmt.Errorf("gap frame count must be positive")
+	}
+	return nil
+}
+
 func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /app.js", a.static("app.js", "application/javascript; charset=utf-8"))
@@ -142,8 +161,34 @@ func (a *app) scanLoop(ctx context.Context) {
 		case <-ticker.C:
 			if result, err := a.catalog.Scan(ctx); err != nil {
 				log.Printf("scan failed: %v", err)
-			} else if result.Changed || result.Errors > 0 {
-				log.Printf("scan seen=%d processed=%d skipped=%d errors=%d changed=%t", result.Seen, result.Processed, result.Skipped, result.Errors, result.Changed)
+			} else {
+				a.handleScanResult(ctx, result)
+			}
+		}
+	}
+}
+
+func (a *app) handleScanResult(ctx context.Context, result catalog.ScanResult) {
+	if result.Changed {
+		if err := a.scheduler.Ensure(ctx, time.Now()); err != nil {
+			log.Printf("schedule refill after scan failed: %v", err)
+		}
+	}
+	if result.Changed || result.Errors > 0 {
+		log.Printf("scan seen=%d processed=%d skipped=%d errors=%d changed=%t", result.Seen, result.Processed, result.Skipped, result.Errors, result.Changed)
+	}
+}
+
+func (a *app) scheduleLoop(ctx context.Context) {
+	ticker := time.NewTicker(a.cfg.ScheduleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := a.scheduler.Ensure(ctx, time.Now()); err != nil {
+				log.Printf("schedule failed: %v", err)
 			}
 		}
 	}

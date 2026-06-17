@@ -11,6 +11,7 @@ files, then the HTTP stream sends MP3 frame ranges directly from disk.
 ## Features
 
 - Global live radio timeline shared by all listeners.
+- Background schedule maintenance, even when nobody is listening.
 - Infinite `audio/mpeg` stream at `GET /radio`.
 - Browser player at `GET /` with play, pause, volume, current track, cover, and
   lyric display.
@@ -60,9 +61,10 @@ Add MP3 files to:
 ./data/inbox
 ```
 
-Raydio scans on startup and then rescans every 30 seconds by default. Converted
-audio, covers, lyrics, the silence file, and the SQLite database are stored
-under `./data`.
+Raydio scans on startup and then rescans every 30 seconds by default. It also
+maintains the future radio schedule every minute by default, even with zero
+listeners. Converted audio, covers, lyrics, the silence file, and the SQLite
+database are stored under `./data`.
 
 ## Command-Line Flags
 
@@ -72,6 +74,7 @@ under `./data`.
 | `-data` | `RAYDIO_DATA` | `./data` | Root data directory. |
 | `-inbox` | `RAYDIO_INBOX` | `<data>/inbox` | Source MP3 directory. |
 | `-rescan` | `RAYDIO_RESCAN` | `30s` | Directory rescan interval. |
+| `-schedule` | `RAYDIO_SCHEDULE` | `1m` | Background schedule maintenance interval. |
 | `-gap-frames` | `RAYDIO_GAP_FRAMES` | `209` | Silence frames inserted between tracks. |
 
 At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
@@ -83,7 +86,8 @@ Example:
 CGO_ENABLED=1 go run ./cmd/raydio \
   -addr 127.0.0.1:8080 \
   -data /srv/raydio \
-  -rescan 15s
+  -rescan 15s \
+  -schedule 1m
 ```
 
 ## Input Files and Metadata
@@ -192,9 +196,15 @@ Raydio stores schedule slots in SQLite. A slot is either a track or silence:
 track A -> silence gap -> track B -> silence gap -> ...
 ```
 
-The scheduler fills future slots ahead of time. Track order uses a shuffle bag.
-When more than one track exists, Raydio avoids choosing the same track for
-adjacent track slots.
+The scheduler fills future slots ahead of time. A background ticker keeps this
+schedule extended while the process is running, even if there are no active
+listeners. Track order uses a shuffle bag. When more than one track exists,
+Raydio avoids choosing the same track for adjacent track slots.
+
+Request handlers normally read the current slot from SQLite. If the current slot
+is unexpectedly missing, the handler performs one fallback refill and retries.
+This keeps `/radio`, `/api/now`, and `/api/events` robust without reverting to a
+lazy-only scheduling model.
 
 When a source file is removed:
 
@@ -205,6 +215,10 @@ When a source file is removed:
 
 When the catalog is empty, the scheduler emits silence slots and `/radio`
 continues streaming valid MP3 audio.
+
+When all listeners disconnect, no audio is played in the background. Raydio only
+continues maintaining schedule rows. The next listener joins the current
+wall-clock slot and frame.
 
 ### Streaming
 

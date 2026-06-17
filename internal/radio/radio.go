@@ -78,9 +78,29 @@ func (s *Scheduler) Ensure(ctx context.Context, now time.Time) error {
 func (s *Scheduler) Position(ctx context.Context, now time.Time) (Position, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.positionLocked(ctx, now)
+}
+
+func (s *Scheduler) PositionOrEnsure(ctx context.Context, now time.Time) (Position, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pos, err := s.positionLocked(ctx, now)
+	if err == nil {
+		return pos, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Position{}, err
+	}
+	if err := s.store.DeleteFutureSlots(ctx, now.UnixMilli()); err != nil {
+		return Position{}, err
+	}
 	if err := s.ensureLocked(ctx, now); err != nil {
 		return Position{}, err
 	}
+	return s.positionLocked(ctx, now)
+}
+
+func (s *Scheduler) positionLocked(ctx context.Context, now time.Time) (Position, error) {
 	nowMs := now.UnixMilli()
 	slot, err := s.store.SlotAt(ctx, nowMs)
 	if err != nil {
@@ -102,7 +122,7 @@ func (s *Scheduler) Position(ctx context.Context, now time.Time) (Position, erro
 }
 
 func (s *Scheduler) Now(ctx context.Context, now time.Time) (Now, error) {
-	pos, err := s.Position(ctx, now)
+	pos, err := s.PositionOrEnsure(ctx, now)
 	if err != nil {
 		return Now{}, err
 	}
@@ -136,7 +156,7 @@ func (s *Scheduler) Chunks(ctx context.Context, now time.Time, frames int64) ([]
 	cursor := now
 	remaining := frames
 	for remaining > 0 {
-		pos, err := s.Position(ctx, cursor)
+		pos, err := s.PositionOrEnsure(ctx, cursor)
 		if err != nil {
 			return nil, err
 		}

@@ -2,6 +2,8 @@ package radio
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -77,5 +79,74 @@ func TestSchedulerUsesSilenceWhenCatalogEmpty(t *testing.T) {
 	}
 	if !pos.Slot.IsSilence || pos.Track != nil {
 		t.Fatalf("empty catalog should produce silence: %+v", pos)
+	}
+}
+
+func TestPositionDoesNotMutateSchedule(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Unix(100, 0)
+	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	if _, err := s.Position(ctx, now); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("Position error = %v, want sql.ErrNoRows", err)
+	}
+	slots, err := st.SlotsEndingAfter(ctx, now.UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(slots) != 0 {
+		t.Fatalf("Position should not create slots, got %+v", slots)
+	}
+}
+
+func TestPositionOrEnsureRefillsMissingSchedule(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Unix(100, 0)
+	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s.fillAhead = 100 * time.Millisecond
+	pos, err := s.PositionOrEnsure(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pos.Slot.IsSilence {
+		t.Fatalf("expected fallback silence slot, got %+v", pos)
+	}
+}
+
+func TestNowAndChunksRecoverFromMissingSchedule(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	now := time.Unix(100, 0)
+	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s.fillAhead = 100 * time.Millisecond
+	gotNow, err := s.Now(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !gotNow.IsSilence {
+		t.Fatalf("expected silence now response, got %+v", gotNow)
+	}
+	chunks, err := s.Chunks(ctx, now, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) == 0 || chunks[0].Path != "/cache/silence.mp3" {
+		t.Fatalf("expected silence chunks, got %+v", chunks)
 	}
 }
