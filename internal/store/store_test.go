@@ -120,6 +120,118 @@ func TestCatalogRevisionChangesWithTracksAndAssets(t *testing.T) {
 	}
 }
 
+func TestNoopTrackUpsertDoesNotChangeCatalogRevision(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	track := Track{
+		ID:            "aaa",
+		SourcePath:    "/music/song.mp3",
+		CachePath:     "/cache/aaa.mp3",
+		Title:         "Song",
+		Artist:        "Artist",
+		DurationMs:    2400,
+		FrameCount:    100,
+		FrameSize:     576,
+		Bitrate:       192000,
+		SampleRate:    48000,
+		Channels:      2,
+		Status:        TrackStatusActive,
+		SourceModUnix: 1,
+	}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.CatalogRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	same, err := st.CatalogRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.Revision != first.Revision {
+		t.Fatalf("revision changed on noop upsert: first=%+v same=%+v", first, same)
+	}
+
+	track.Title = "Song v2"
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := st.CatalogRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Revision <= same.Revision {
+		t.Fatalf("revision did not change after track update: same=%+v changed=%+v", same, changed)
+	}
+}
+
+func TestNoopAssetUpsertDoesNotChangeCatalogRevision(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	track := Track{
+		ID:            "aaa",
+		SourcePath:    "/music/song.mp3",
+		CachePath:     "/cache/aaa.mp3",
+		Title:         "Song",
+		Artist:        "Artist",
+		DurationMs:    2400,
+		FrameCount:    100,
+		FrameSize:     576,
+		Bitrate:       192000,
+		SampleRate:    48000,
+		Channels:      2,
+		Status:        TrackStatusActive,
+		SourceModUnix: 1,
+	}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	asset := Asset{TrackID: track.ID, Kind: "cover", Path: "/cache/cover.jpg", MIME: "image/jpeg"}
+	if err := st.UpsertAsset(ctx, asset); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.CatalogRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAsset(ctx, asset); err != nil {
+		t.Fatal(err)
+	}
+	same, err := st.CatalogRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same.Revision != first.Revision {
+		t.Fatalf("revision changed on noop asset upsert: first=%+v same=%+v", first, same)
+	}
+
+	asset.Path = "/cache/cover-v2.jpg"
+	if err := st.UpsertAsset(ctx, asset); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := st.CatalogRevision(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.Revision <= same.Revision {
+		t.Fatalf("revision did not change after asset update: same=%+v changed=%+v", same, changed)
+	}
+}
+
 func TestListCatalogPageReturnsPublicFieldsAndAssetURLs(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))

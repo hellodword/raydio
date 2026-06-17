@@ -11,6 +11,9 @@ const coverFallback = document.getElementById("coverFallback");
 
 let currentNow = null;
 let lyrics = [];
+let lyricIndex = -1;
+let lyricsTrackID = "";
+let lyricsRequestID = 0;
 let serverOffsetMs = 0;
 
 audio.volume = Number(volume.value);
@@ -51,6 +54,9 @@ function renderNow(now) {
     coverFallback.style.display = "grid";
     statusText.textContent = audio.paused ? "ready" : "playing";
     lyrics = [];
+    lyricIndex = -1;
+    lyricsTrackID = "";
+    lyricsRequestID++;
     return;
   }
 
@@ -69,18 +75,33 @@ function renderNow(now) {
   }
 
   if (now.track.lyricsUrl) {
+    if (lyricsTrackID === now.track.id) {
+      updateLyric();
+      return;
+    }
+    const requestID = ++lyricsRequestID;
+    const trackID = now.track.id;
     fetch(now.track.lyricsUrl, { cache: "no-store" })
       .then((res) => (res.ok ? res.text() : ""))
       .then((text) => {
+        if (requestID !== lyricsRequestID) return;
         lyrics = parseLRC(text);
+        lyricIndex = -1;
+        lyricsTrackID = trackID;
         updateLyric();
       })
       .catch(() => {
+        if (requestID !== lyricsRequestID) return;
         lyrics = [];
+        lyricIndex = -1;
+        lyricsTrackID = "";
         lyricText.textContent = "";
       });
   } else {
+    lyricsRequestID++;
     lyrics = [];
+    lyricIndex = -1;
+    lyricsTrackID = "";
     lyricText.textContent = "";
   }
 }
@@ -102,12 +123,13 @@ function updateLyric() {
   if (!currentNow || lyrics.length === 0) return;
   const serverNow = Date.now() + serverOffsetMs;
   const elapsed = serverNow - currentNow.startedAtMs;
-  let current = "";
-  for (const row of lyrics) {
-    if (row.at <= elapsed) current = row.text;
-    else break;
+  while (lyricIndex + 1 < lyrics.length && lyrics[lyricIndex + 1].at <= elapsed) {
+    lyricIndex++;
   }
-  lyricText.textContent = current;
+  while (lyricIndex >= 0 && lyrics[lyricIndex].at > elapsed) {
+    lyricIndex--;
+  }
+  lyricText.textContent = lyricIndex >= 0 ? lyrics[lyricIndex].text : "";
 }
 
 function connectEvents() {

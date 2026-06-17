@@ -67,6 +67,8 @@ type enginePosition struct {
 	durationMs int64
 }
 
+var emptyAssetURLs = map[string]string{}
+
 func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if cfg.Scheduler == nil {
 		return nil, errors.New("scheduler is required")
@@ -154,25 +156,12 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	assets, err := e.cfg.Store.AssetsByTrackIDs(ctx, ids)
+	allAssets, err := e.cfg.Store.ListAssets(ctx)
 	if err != nil {
 		return err
 	}
-
-	urls := make(map[string]map[string]string, len(assets))
-	for trackID, byKind := range assets {
-		for _, a := range byKind {
-			if urls[trackID] == nil {
-				urls[trackID] = map[string]string{}
-			}
-			switch a.Kind {
-			case "cover":
-				urls[trackID]["cover"] = "/covers/" + trackID
-			case "lyrics":
-				urls[trackID]["lyrics"] = "/lyrics/" + trackID
-			}
-		}
-	}
+	assets := assetsByTrack(allAssets)
+	urls := assetURLsByTrack(assets)
 
 	e.stateMu.Lock()
 	e.slots = slots
@@ -262,7 +251,10 @@ func (e *Engine) producerLoop(ctx context.Context) {
 		}
 		slog.Error("radio engine publish failed", "error", err)
 	}
-	readCh := e.prefetchAudio(ctx, at.Add(e.chunkDuration))
+	readReq, readCh := e.startAudioReader(ctx)
+	if !queueAudioRead(ctx, readReq, at.Add(e.chunkDuration)) {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -286,7 +278,9 @@ func (e *Engine) producerLoop(ctx context.Context) {
 			}
 			slog.Error("radio engine publish failed", "error", err)
 		}
-		readCh = e.prefetchAudio(ctx, result.at.Add(e.chunkDuration))
+		if !queueAudioRead(ctx, readReq, result.at.Add(e.chunkDuration)) {
+			return
+		}
 	}
 }
 
@@ -296,13 +290,34 @@ type audioReadResult struct {
 	err  error
 }
 
-func (e *Engine) prefetchAudio(ctx context.Context, at time.Time) <-chan audioReadResult {
-	ch := make(chan audioReadResult, 1)
+func (e *Engine) startAudioReader(ctx context.Context) (chan<- time.Time, <-chan audioReadResult) {
+	reqCh := make(chan time.Time, 1)
+	resCh := make(chan audioReadResult, 1)
 	go func() {
-		data, err := e.readAudio(ctx, at, e.chunkFrames)
-		ch <- audioReadResult{at: at, data: data, err: err}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case at := <-reqCh:
+				data, err := e.readAudio(ctx, at, e.chunkFrames)
+				select {
+				case <-ctx.Done():
+					return
+				case resCh <- audioReadResult{at: at, data: data, err: err}:
+				}
+			}
+		}
 	}()
-	return ch
+	return reqCh, resCh
+}
+
+func queueAudioRead(ctx context.Context, ch chan<- time.Time, at time.Time) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case ch <- at:
+		return true
+	}
 }
 
 func (e *Engine) publishTick(ctx context.Context, now time.Time) error {
@@ -440,7 +455,7 @@ func (e *Engine) cachedPosition(now time.Time) (enginePosition, bool) {
 		}
 	}
 	if pos.assetURLs == nil {
-		pos.assetURLs = map[string]string{}
+		pos.assetURLs = emptyAssetURLs
 	}
 	return pos, true
 }
@@ -476,6 +491,35 @@ func hasUnknownTrack(slots []store.Slot, tracks map[string]store.Track) bool {
 		}
 	}
 	return false
+}
+
+func assetsByTrack(assets []store.Asset) map[string]map[string]store.Asset {
+	out := make(map[string]map[string]store.Asset, len(assets))
+	for _, a := range assets {
+		if out[a.TrackID] == nil {
+			out[a.TrackID] = map[string]store.Asset{}
+		}
+		out[a.TrackID][a.Kind] = a
+	}
+	return out
+}
+
+func assetURLsByTrack(assets map[string]map[string]store.Asset) map[string]map[string]string {
+	out := make(map[string]map[string]string, len(assets))
+	for trackID, byKind := range assets {
+		for _, a := range byKind {
+			if out[trackID] == nil {
+				out[trackID] = map[string]string{}
+			}
+			switch a.Kind {
+			case "cover":
+				out[trackID]["cover"] = "/covers/" + trackID
+			case "lyrics":
+				out[trackID]["lyrics"] = "/lyrics/" + trackID
+			}
+		}
+	}
+	return out
 }
 
 func (e *Engine) appendSilence(ctx context.Context, out []byte, written, frames int64) ([]byte, error) {

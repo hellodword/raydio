@@ -264,6 +264,36 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 	}
 }
 
+func TestServeAssetUsesETag(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cover.jpg")
+	if err := os.WriteFile(path, []byte("cover"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	asset := store.Asset{TrackID: "aaa", Kind: "cover", Path: path, MIME: "image/jpeg"}
+
+	req := httptest.NewRequest(http.MethodGet, "/covers/aaa", nil)
+	rr := httptest.NewRecorder()
+	serveAsset(rr, req, asset)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	etag := rr.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("expected ETag")
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/covers/aaa", nil)
+	req.Header.Set("If-None-Match", etag)
+	rr = httptest.NewRecorder()
+	serveAsset(rr, req, asset)
+	if rr.Code != http.StatusNotModified {
+		t.Fatalf("etag status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.Len() != 0 {
+		t.Fatalf("304 body = %q", rr.Body.String())
+	}
+}
+
 func TestServeWebFileUsesPreloadedBytesAndETag(t *testing.T) {
 	files, err := loadWebFiles()
 	if err != nil {

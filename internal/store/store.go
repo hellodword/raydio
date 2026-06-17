@@ -253,8 +253,8 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 	if t.FrameSize == 0 {
 		t.FrameSize = 576
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, updated_at=? WHERE source_path=? AND id<>?`,
-		TrackStatusMissing, now, t.SourcePath, t.ID); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, updated_at=? WHERE source_path=? AND id<>? AND status<>?`,
+		TrackStatusMissing, now, t.SourcePath, t.ID, TrackStatusMissing); err != nil {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO tracks (
@@ -279,7 +279,23 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		channels=excluded.channels,
 		status=excluded.status,
 		error=excluded.error,
-		updated_at=excluded.updated_at`,
+		updated_at=excluded.updated_at
+	WHERE tracks.source_path IS NOT excluded.source_path
+		OR tracks.source_size IS NOT excluded.source_size
+		OR tracks.source_mod_unix IS NOT excluded.source_mod_unix
+		OR tracks.cache_path IS NOT excluded.cache_path
+		OR tracks.title IS NOT excluded.title
+		OR tracks.artist IS NOT excluded.artist
+		OR tracks.album IS NOT excluded.album
+		OR tracks.comment IS NOT excluded.comment
+		OR tracks.duration_ms IS NOT excluded.duration_ms
+		OR tracks.frame_count IS NOT excluded.frame_count
+		OR tracks.frame_size IS NOT excluded.frame_size
+		OR tracks.bitrate IS NOT excluded.bitrate
+		OR tracks.sample_rate IS NOT excluded.sample_rate
+		OR tracks.channels IS NOT excluded.channels
+		OR tracks.status IS NOT excluded.status
+		OR tracks.error IS NOT excluded.error`,
 		t.ID, t.SourcePath, t.SourceSize, t.SourceModUnix, t.CachePath, t.Title, t.Artist, t.Album, t.Comment,
 		t.DurationMs, t.FrameCount, t.FrameSize, t.Bitrate, t.SampleRate, t.Channels, t.Status, t.Error,
 		now, now)
@@ -289,7 +305,8 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 func (s *Store) UpsertAsset(ctx context.Context, a Asset) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO track_assets(track_id, kind, path, mime, updated_at)
 		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(track_id, kind) DO UPDATE SET path=excluded.path, mime=excluded.mime, updated_at=excluded.updated_at`,
+		ON CONFLICT(track_id, kind) DO UPDATE SET path=excluded.path, mime=excluded.mime, updated_at=excluded.updated_at
+		WHERE track_assets.path IS NOT excluded.path OR track_assets.mime IS NOT excluded.mime`,
 		a.TrackID, a.Kind, a.Path, a.MIME, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
@@ -356,8 +373,8 @@ func (s *Store) CatalogRevision(ctx context.Context) (CatalogRevision, error) {
 }
 
 func (s *Store) SetTrackStatus(ctx context.Context, id, status string, errText sql.NullString) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, error=?, updated_at=? WHERE id=?`,
-		status, errText, time.Now().UTC().Format(time.RFC3339Nano), id)
+	_, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, error=?, updated_at=? WHERE id=? AND (status IS NOT ? OR error IS NOT ?)`,
+		status, errText, time.Now().UTC().Format(time.RFC3339Nano), id, status, errText)
 	return err
 }
 
@@ -406,16 +423,23 @@ func (s *Store) ListCatalogPage(ctx context.Context, afterTitle, afterID string,
 	if limit <= 0 {
 		return nil, nil
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT
-			t.id, t.title, t.artist, t.album, t.duration_ms,
-			EXISTS(SELECT 1 FROM track_assets a WHERE a.track_id=t.id AND a.kind='cover'),
-			EXISTS(SELECT 1 FROM track_assets a WHERE a.track_id=t.id AND a.kind='lyrics')
-		FROM tracks t
-		WHERE t.status=?
-			AND ((?='' AND ?='') OR t.title COLLATE NOCASE > ? COLLATE NOCASE
-				OR (t.title COLLATE NOCASE = ? COLLATE NOCASE AND t.id > ?))
-		ORDER BY t.title COLLATE NOCASE, t.id
-		LIMIT ?`,
+	rows, err := s.db.QueryContext(ctx, `WITH page AS (
+			SELECT t.id, t.title, t.artist, t.album, t.duration_ms
+			FROM tracks t
+			WHERE t.status=?
+				AND ((?='' AND ?='') OR t.title COLLATE NOCASE > ? COLLATE NOCASE
+					OR (t.title COLLATE NOCASE = ? COLLATE NOCASE AND t.id > ?))
+			ORDER BY t.title COLLATE NOCASE, t.id
+			LIMIT ?
+		)
+		SELECT
+			p.id, p.title, p.artist, p.album, p.duration_ms,
+			MAX(CASE WHEN a.kind='cover' THEN 1 ELSE 0 END),
+			MAX(CASE WHEN a.kind='lyrics' THEN 1 ELSE 0 END)
+		FROM page p
+		LEFT JOIN track_assets a ON a.track_id=p.id AND a.kind IN ('cover', 'lyrics')
+		GROUP BY p.id, p.title, p.artist, p.album, p.duration_ms
+		ORDER BY p.title COLLATE NOCASE, p.id`,
 		TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
 	if err != nil {
 		return nil, err

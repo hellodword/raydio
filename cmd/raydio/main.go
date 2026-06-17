@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -468,9 +469,36 @@ func loadWebFiles() (map[string]webFile, error) {
 }
 
 func serveAsset(w http.ResponseWriter, r *http.Request, a store.Asset) {
+	f, err := os.Open(a.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	etag := assetETag(a, info)
 	w.Header().Set("Content-Type", a.MIME)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
-	http.ServeFile(w, r, a.Path)
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	http.ServeContent(w, r, filepath.Base(a.Path), info.ModTime(), f)
+}
+
+func assetETag(a store.Asset, info os.FileInfo) string {
+	key := fmt.Sprintf("%s\x00%s\x00%s\x00%d\x00%d", a.TrackID, a.Kind, a.Path, info.Size(), info.ModTime().UnixNano())
+	sum := sha256.Sum256([]byte(key))
+	return `"` + base64.RawURLEncoding.EncodeToString(sum[:12]) + `"`
 }
 
 func parseCatalogLimit(raw string) (int, error) {

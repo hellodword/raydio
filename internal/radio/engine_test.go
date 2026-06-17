@@ -182,6 +182,65 @@ func TestEngineRefreshCachesScheduledAssets(t *testing.T) {
 	}
 }
 
+func TestEngineRefreshCachesAssetsOutsideSchedule(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	active := store.Track{
+		ID:            "abcdef1234567890",
+		SourcePath:    "/inbox/a.mp3",
+		CachePath:     "/cache/a.mp3",
+		Title:         "A",
+		Artist:        "Artist",
+		DurationMs:    2400,
+		FrameCount:    100,
+		FrameSize:     576,
+		Bitrate:       192000,
+		SampleRate:    48000,
+		Channels:      2,
+		Status:        store.TrackStatusActive,
+		SourceModUnix: 1,
+	}
+	inactive := active
+	inactive.ID = "fedcba0987654321"
+	inactive.SourcePath = "/inbox/inactive.mp3"
+	inactive.CachePath = "/cache/inactive.mp3"
+	inactive.Title = "Inactive"
+	inactive.Status = store.TrackStatusMissing
+	if err := st.UpsertTrack(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertTrack(ctx, inactive); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAsset(ctx, store.Asset{TrackID: inactive.ID, Kind: "cover", Path: "/cache/inactive.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewEngine(EngineConfig{
+		Scheduler:          NewScheduler(st, "/cache/silence.mp3", 5),
+		Store:              st,
+		SilencePath:        "/cache/silence.mp3",
+		RefreshInterval:    time.Minute,
+		StreamChunkWindow:  frameDuration(1),
+		StreamBufferWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Refresh(ctx, time.Unix(100, 0)); err != nil {
+		t.Fatal(err)
+	}
+	asset, ok := e.Asset(inactive.ID, "cover")
+	if !ok || asset.Path != "/cache/inactive.jpg" {
+		t.Fatalf("cached inactive asset = %+v ok=%v", asset, ok)
+	}
+}
+
 func TestEngineReadAudioMissPublishesSilenceAndRequestsRefresh(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
