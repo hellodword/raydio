@@ -10,7 +10,7 @@ gap_frames: 209
 
 # Minimum structured log level for all binaries.
 # Supported values: DEBUG, INFO, WARN, ERROR.
-log_level: DEBUG
+log_level: INFO
 
 radios:
   # Each configured radio scans <worker.inbox_dir>/<uuid> and streams at
