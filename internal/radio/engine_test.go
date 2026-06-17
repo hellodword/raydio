@@ -2,7 +2,13 @@ package radio
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"raydio/internal/audio"
+	"raydio/internal/store"
 )
 
 func TestAudioRingSkipsSlowSubscriberToOldestBufferedPacket(t *testing.T) {
@@ -49,5 +55,100 @@ func TestFramesForDurationRoundsUpToWholeFrame(t *testing.T) {
 	}
 	if got := framesForDuration(frameDuration(10) + 1); got != 11 {
 		t.Fatalf("rounded frames = %d, want 11", got)
+	}
+}
+
+func TestEngineRefreshSkipsCatalogReloadWhenRevisionUnchanged(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	track := store.Track{
+		ID:            "abcdef1234567890",
+		SourcePath:    "/inbox/a.mp3",
+		CachePath:     "/cache/a.mp3",
+		Title:         "A",
+		Artist:        "Artist",
+		DurationMs:    2400,
+		FrameCount:    100,
+		FrameSize:     576,
+		Bitrate:       192000,
+		SampleRate:    48000,
+		Channels:      2,
+		Status:        store.TrackStatusActive,
+		SourceModUnix: 1,
+	}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewEngine(EngineConfig{
+		Scheduler:          NewScheduler(st, "/cache/silence.mp3", 5),
+		Store:              st,
+		SilencePath:        "/cache/silence.mp3",
+		RefreshInterval:    time.Minute,
+		StreamChunkWindow:  frameDuration(1),
+		StreamBufferWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(100, 0)
+	if err := e.Refresh(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	e.stateMu.Lock()
+	e.catalog[0].Title = "Sentinel"
+	e.stateMu.Unlock()
+
+	if err := e.Refresh(ctx, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Catalog()[0].Title; got != "Sentinel" {
+		t.Fatalf("catalog reloaded despite stable revision, title = %q", got)
+	}
+
+	time.Sleep(time.Millisecond)
+	track.Title = "B"
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Refresh(ctx, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.Catalog()[0].Title; got != "B" {
+		t.Fatalf("catalog did not reload after revision change, title = %q", got)
+	}
+}
+
+func TestEngineReadAudioMissPublishesSilenceAndRequestsRefresh(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	silencePath := filepath.Join(dir, "silence.mp3")
+	if err := os.WriteFile(silencePath, make([]byte, 5*audio.FrameSize), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e := &Engine{
+		cfg: EngineConfig{
+			Scheduler:   &Scheduler{gapFrames: 5},
+			SilencePath: silencePath,
+		},
+		refreshCh: make(chan struct{}, 1),
+	}
+	got, err := e.readAudio(ctx, time.Unix(100, 0), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3*int(audio.FrameSize) {
+		t.Fatalf("silence length = %d, want %d", len(got), 3*audio.FrameSize)
+	}
+	select {
+	case <-e.refreshCh:
+	default:
+		t.Fatal("expected cache miss to request refresh")
 	}
 }

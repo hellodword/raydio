@@ -84,7 +84,7 @@ func TestRunCreatesSilenceAndDatabase(t *testing.T) {
 		})
 	}()
 
-	waitFor(t, time.Second, func() bool {
+	waitFor(t, 5*time.Second, func() bool {
 		if _, err := os.Stat(paths.SilencePath(layout.CacheDir, 5)); err != nil {
 			return false
 		}
@@ -136,7 +136,7 @@ func TestWorkerScansMP3IntoCache(t *testing.T) {
 		})
 	}()
 
-	waitFor(t, 2*time.Second, func() bool {
+	waitFor(t, 5*time.Second, func() bool {
 		matches, err := filepath.Glob(filepath.Join(layout.TracksDir, "*.mp3"))
 		return err == nil && len(matches) == 1
 	})

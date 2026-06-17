@@ -39,12 +39,15 @@ type Engine struct {
 	catalog   []store.Track
 
 	refreshMu sync.Mutex
+	refreshCh chan struct{}
 
 	now atomic.Value
 
 	eventMu       sync.Mutex
 	eventSubs     map[chan Now]struct{}
 	lastEventSlot string
+	catalogRev    store.CatalogRevision
+	catalogLoaded bool
 
 	currentFilePath string
 	currentFile     *os.File
@@ -95,6 +98,7 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 		ring:          newAudioRing(capacity),
 		tracks:        map[string]store.Track{},
 		assetURLs:     map[string]map[string]string{},
+		refreshCh:     make(chan struct{}, 1),
 		eventSubs:     map[chan Now]struct{}{},
 	}
 	e.now.Store(Now{ServerTimeMs: time.Now().UnixMilli()})
@@ -121,15 +125,33 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err := e.cfg.Scheduler.Ensure(ctx, now); err != nil {
 		return err
 	}
+	slots, err := e.cfg.Store.SlotsEndingAfter(ctx, now.Add(-e.cfg.StreamBufferWindow).UnixMilli())
+	if err != nil {
+		return err
+	}
+	rev, err := e.cfg.Store.CatalogRevision(ctx)
+	if err != nil {
+		return err
+	}
+
+	e.stateMu.RLock()
+	loaded := e.catalogLoaded
+	oldRev := e.catalogRev
+	unknownTrack := loaded && hasUnknownTrack(slots, e.tracks)
+	e.stateMu.RUnlock()
+
+	if loaded && rev == oldRev && !unknownTrack {
+		e.stateMu.Lock()
+		e.slots = slots
+		e.stateMu.Unlock()
+		return nil
+	}
+
 	tracks, err := e.cfg.Store.ListTracks(ctx)
 	if err != nil {
 		return err
 	}
 	assets, err := e.cfg.Store.ListAssets(ctx)
-	if err != nil {
-		return err
-	}
-	slots, err := e.cfg.Store.SlotsEndingAfter(ctx, now.Add(-e.cfg.StreamBufferWindow).UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -156,6 +178,8 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	e.tracks = trackByID
 	e.assetURLs = urls
 	e.catalog = append([]store.Track(nil), tracks...)
+	e.catalogRev = rev
+	e.catalogLoaded = true
 	e.stateMu.Unlock()
 	return nil
 }
@@ -207,6 +231,12 @@ func (e *Engine) refreshLoop(ctx context.Context) {
 			} else {
 				slog.Debug("radio engine refresh complete")
 			}
+		case <-e.refreshCh:
+			if err := e.Refresh(ctx, time.Now()); err != nil {
+				slog.Error("radio engine requested refresh failed", "error", err)
+			} else {
+				slog.Debug("radio engine requested refresh complete")
+			}
 		}
 	}
 }
@@ -249,6 +279,9 @@ func (e *Engine) readAudio(ctx context.Context, now time.Time, frames int64) ([]
 	for remaining > 0 {
 		pos, err := e.position(ctx, cursor)
 		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return e.appendSilence(ctx, out, remaining)
+			}
 			return nil, err
 		}
 		frameIndex := pos.elapsedMs / audio.FrameDurationMs
@@ -279,7 +312,22 @@ func (e *Engine) readAudio(ctx context.Context, now time.Time, frames int64) ([]
 func (e *Engine) updateNow(ctx context.Context, now time.Time) error {
 	pos, err := e.position(ctx, now)
 	if err != nil {
-		return err
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		nowMs := now.UnixMilli()
+		out := Now{
+			ServerTimeMs: nowMs,
+			SlotID:       "engine-miss",
+			IsSilence:    true,
+			StartedAtMs:  nowMs,
+			EndsAtMs:     nowMs + e.chunkDuration.Milliseconds(),
+			ElapsedMs:    0,
+			DurationMs:   e.chunkDuration.Milliseconds(),
+		}
+		e.now.Store(out)
+		e.publishEvent(out)
+		return nil
 	}
 	out := Now{
 		ServerTimeMs: now.UnixMilli(),
@@ -310,14 +358,8 @@ func (e *Engine) position(ctx context.Context, now time.Time) (enginePosition, e
 	if ok {
 		return pos, nil
 	}
-	if err := e.Refresh(ctx, now); err != nil {
-		return enginePosition{}, err
-	}
-	pos, ok = e.cachedPosition(now)
-	if !ok {
-		return enginePosition{}, sql.ErrNoRows
-	}
-	return pos, nil
+	e.requestRefresh()
+	return enginePosition{}, sql.ErrNoRows
 }
 
 func (e *Engine) cachedPosition(now time.Time) (enginePosition, bool) {
@@ -365,6 +407,42 @@ func (e *Engine) publishEvent(now Now) {
 		default:
 		}
 	}
+}
+
+func (e *Engine) requestRefresh() {
+	select {
+	case e.refreshCh <- struct{}{}:
+	default:
+	}
+}
+
+func hasUnknownTrack(slots []store.Slot, tracks map[string]store.Track) bool {
+	for _, sl := range slots {
+		if sl.TrackID.Valid {
+			if _, ok := tracks[sl.TrackID.String]; !ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (e *Engine) appendSilence(ctx context.Context, out []byte, frames int64) ([]byte, error) {
+	silenceFrames := e.cfg.Scheduler.gapFrames
+	if silenceFrames <= 0 {
+		silenceFrames = frames
+	}
+	remaining := frames
+	for remaining > 0 {
+		use := minInt64(remaining, silenceFrames)
+		b, err := e.readFrameRange(ctx, e.cfg.SilencePath, 0, use)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, b...)
+		remaining -= use
+	}
+	return out, nil
 }
 
 func (e *Engine) readFrameRange(ctx context.Context, path string, frameIndex, frames int64) ([]byte, error) {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -19,6 +20,13 @@ const (
 
 type Store struct {
 	db *sql.DB
+}
+
+type CatalogRevision struct {
+	TrackCount     int64
+	TrackUpdatedAt string
+	AssetCount     int64
+	AssetUpdatedAt string
 }
 
 type Track struct {
@@ -60,11 +68,12 @@ type Slot struct {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite3", sqliteDSN(path))
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 
 	s := &Store{db: db}
 	if err := s.configure(ctx); err != nil {
@@ -76,6 +85,15 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+func sqliteDSN(path string) string {
+	values := url.Values{}
+	values.Set("_busy_timeout", "5000")
+	values.Set("_foreign_keys", "on")
+	values.Set("_journal_mode", "WAL")
+	values.Set("_synchronous", "NORMAL")
+	return "file:" + path + "?" + values.Encode()
 }
 
 func (s *Store) Close() error {
@@ -136,6 +154,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 			kind TEXT NOT NULL,
 			path TEXT NOT NULL,
 			mime TEXT NOT NULL,
+			updated_at TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (track_id, kind),
 			FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
 		)`,
@@ -150,6 +169,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 			FOREIGN KEY (track_id) REFERENCES tracks(id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_time ON schedule_slots(start_unix_ms, end_unix_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_end ON schedule_slots(end_unix_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_tracks_title_nocase ON tracks(title COLLATE NOCASE, id)`,
+		`CREATE INDEX IF NOT EXISTS idx_tracks_status_title_nocase ON tracks(status, title COLLATE NOCASE, id)`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
@@ -162,7 +184,21 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.ensureColumn(ctx, "track_assets", "updated_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition))
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return nil
+	}
+	return err
 }
 
 func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
@@ -207,10 +243,10 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 }
 
 func (s *Store) UpsertAsset(ctx context.Context, a Asset) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO track_assets(track_id, kind, path, mime)
-		VALUES (?, ?, ?, ?)
-		ON CONFLICT(track_id, kind) DO UPDATE SET path=excluded.path, mime=excluded.mime`,
-		a.TrackID, a.Kind, a.Path, a.MIME)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO track_assets(track_id, kind, path, mime, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(track_id, kind) DO UPDATE SET path=excluded.path, mime=excluded.mime, updated_at=excluded.updated_at`,
+		a.TrackID, a.Kind, a.Path, a.MIME, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
@@ -263,6 +299,20 @@ func (s *Store) ListAssets(ctx context.Context) ([]Asset, error) {
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) CatalogRevision(ctx context.Context) (CatalogRevision, error) {
+	var rev CatalogRevision
+	err := s.db.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM tracks),
+		(SELECT COALESCE(MAX(updated_at), '') FROM tracks),
+		(SELECT COUNT(*) FROM track_assets),
+		(SELECT COALESCE(MAX(updated_at), '') FROM track_assets)`,
+	).Scan(&rev.TrackCount, &rev.TrackUpdatedAt, &rev.AssetCount, &rev.AssetUpdatedAt)
+	if err != nil {
+		return CatalogRevision{}, err
+	}
+	return rev, nil
 }
 
 func (s *Store) SetTrackStatus(ctx context.Context, id, status string, errText sql.NullString) error {
@@ -390,7 +440,7 @@ func (s *Store) UpsertSlot(ctx context.Context, sl Slot) error {
 
 func (s *Store) SlotsEndingAfter(ctx context.Context, unixMs int64) ([]Slot, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
-		FROM schedule_slots WHERE end_unix_ms > ? ORDER BY start_unix_ms ASC`, unixMs)
+		FROM schedule_slots WHERE end_unix_ms > ? ORDER BY end_unix_ms ASC`, unixMs)
 	if err != nil {
 		return nil, err
 	}

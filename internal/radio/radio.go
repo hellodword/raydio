@@ -25,6 +25,11 @@ type Scheduler struct {
 	rng         *rand.Rand
 }
 
+type trackSet struct {
+	byID map[string]store.Track
+	ids  []string
+}
+
 type Chunk struct {
 	Path   string
 	Offset int64
@@ -201,12 +206,13 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 	if start < now.UnixMilli() {
 		start = now.UnixMilli()
 	}
+	tracks, err := s.store.ListActiveTracks(ctx)
+	if err != nil {
+		return err
+	}
+	set := newTrackSet(tracks)
 	for start < targetEnd {
-		tracks, err := s.store.ListActiveTracks(ctx)
-		if err != nil {
-			return err
-		}
-		if len(tracks) == 0 {
+		if len(set.ids) == 0 {
 			slot := s.makeSilenceSlot(start, s.gapFrames, "empty")
 			if err := s.store.UpsertSlot(ctx, slot); err != nil {
 				return err
@@ -214,7 +220,7 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 			start = slot.EndUnixMs
 			continue
 		}
-		t := s.nextTrack(tracks)
+		t := s.nextTrack(set)
 		trackSlot := store.Slot{
 			ID:          fmt.Sprintf("%d-%s", start, t.ID[:12]),
 			StartUnixMs: start,
@@ -246,7 +252,7 @@ func (s *Scheduler) makeSilenceSlot(startMs int64, frames int64, prefix string) 
 	}
 }
 
-func (s *Scheduler) nextTrack(tracks []store.Track) store.Track {
+func newTrackSet(tracks []store.Track) trackSet {
 	byID := map[string]store.Track{}
 	ids := make([]string, 0, len(tracks))
 	for _, t := range tracks {
@@ -254,24 +260,29 @@ func (s *Scheduler) nextTrack(tracks []store.Track) store.Track {
 		ids = append(ids, t.ID)
 	}
 	sort.Strings(ids)
-	if len(ids) == 1 {
-		s.lastTrack = ids[0]
-		return byID[ids[0]]
+	return trackSet{byID: byID, ids: ids}
+}
+
+func (s *Scheduler) nextTrack(set trackSet) store.Track {
+	if len(set.ids) == 1 {
+		s.lastTrack = set.ids[0]
+		return set.byID[set.ids[0]]
 	}
-	for len(s.bag) == 0 {
-		s.bag = append([]string(nil), ids...)
-		s.rng.Shuffle(len(s.bag), func(i, j int) { s.bag[i], s.bag[j] = s.bag[j], s.bag[i] })
-		if len(s.bag) > 1 && s.bag[0] == s.lastTrack {
-			s.bag[0], s.bag[1] = s.bag[1], s.bag[0]
+	for {
+		for len(s.bag) == 0 {
+			s.bag = append([]string(nil), set.ids...)
+			s.rng.Shuffle(len(s.bag), func(i, j int) { s.bag[i], s.bag[j] = s.bag[j], s.bag[i] })
+			if len(s.bag) > 1 && s.bag[0] == s.lastTrack {
+				s.bag[0], s.bag[1] = s.bag[1], s.bag[0]
+			}
+		}
+		id := s.bag[0]
+		s.bag = s.bag[1:]
+		if t, ok := set.byID[id]; ok {
+			s.lastTrack = id
+			return t
 		}
 	}
-	id := s.bag[0]
-	s.bag = s.bag[1:]
-	if _, ok := byID[id]; !ok {
-		return s.nextTrack(tracks)
-	}
-	s.lastTrack = id
-	return byID[id]
 }
 
 func assetURLs(ctx context.Context, st *store.Store, trackID string) map[string]string {
