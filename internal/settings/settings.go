@@ -1,16 +1,15 @@
 package settings
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
+
+	"go.yaml.in/yaml/v4"
 )
 
 type File struct {
@@ -46,6 +45,39 @@ type Worker struct {
 	RescanInterval time.Duration
 }
 
+type rawFile struct {
+	DataDir   *string    `yaml:"data_dir"`
+	GapFrames *int64     `yaml:"gap_frames"`
+	LogLevel  *string    `yaml:"log_level"`
+	Radios    []rawRadio `yaml:"radios"`
+	Server    rawServer  `yaml:"server"`
+	Suno      rawSuno    `yaml:"suno"`
+	Worker    rawWorker  `yaml:"worker"`
+}
+
+type rawRadio struct {
+	Alias string `yaml:"alias"`
+	UUID  string `yaml:"uuid"`
+}
+
+type rawServer struct {
+	Addr               *string `yaml:"addr"`
+	ScheduleInterval   *string `yaml:"schedule_interval"`
+	StreamChunkWindow  *string `yaml:"stream_chunk_window"`
+	StreamBufferWindow *string `yaml:"stream_buffer_window"`
+	StreamWriteTimeout *string `yaml:"stream_write_timeout"`
+}
+
+type rawSuno struct {
+	SyncInterval *string `yaml:"sync_interval"`
+	HTTPTimeout  *string `yaml:"http_timeout"`
+}
+
+type rawWorker struct {
+	InboxDir       *string `yaml:"inbox_dir"`
+	RescanInterval *string `yaml:"rescan_interval"`
+}
+
 func Defaults() File {
 	return File{
 		DataDir:   "./data",
@@ -74,7 +106,7 @@ func Load(path string) (File, error) {
 	if err != nil {
 		return File{}, fmt.Errorf("read config %s: %w", path, err)
 	}
-	if err := parseYAMLSubset(b, &cfg); err != nil {
+	if err := parseYAML(b, &cfg); err != nil {
 		return File{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	resolvePaths(filepath.Dir(path), &cfg)
@@ -96,249 +128,69 @@ func resolvePath(base, path string) string {
 	return filepath.Clean(filepath.Join(base, path))
 }
 
-func parseYAMLSubset(b []byte, cfg *File) error {
-	scanner := bufio.NewScanner(bytes.NewReader(b))
-	section := ""
-	currentRadio := -1
-	for lineNo := 1; scanner.Scan(); lineNo++ {
-		raw := scanner.Text()
-		if lineNo == 1 {
-			raw = strings.TrimPrefix(raw, "\ufeff")
-		}
-		trimmed := strings.TrimSpace(raw)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if strings.HasPrefix(raw, "\t") {
-			return fmt.Errorf("line %d: tabs are not supported for indentation", lineNo)
-		}
-		indent := len(raw) - len(strings.TrimLeft(raw, " "))
-		if indent != 0 && indent != 2 && indent != 4 {
-			return fmt.Errorf("line %d: expected top-level key, two-space section indentation, or radio item indentation", lineNo)
-		}
-
-		line := strings.TrimSpace(stripComment(raw))
-		if line == "" {
-			continue
-		}
-		if section == "radios" && indent == 2 {
-			if !strings.HasPrefix(line, "- ") {
-				return fmt.Errorf("line %d: expected radio list item", lineNo)
-			}
-			item := strings.TrimSpace(strings.TrimPrefix(line, "- "))
-			cfg.Radios = append(cfg.Radios, Radio{})
-			currentRadio = len(cfg.Radios) - 1
-			if item == "" {
-				continue
-			}
-			key, value, ok := strings.Cut(item, ":")
-			if !ok {
-				return fmt.Errorf("line %d: expected key: value", lineNo)
-			}
-			key = strings.TrimSpace(key)
-			value = strings.TrimSpace(value)
-			if value == "" {
-				return fmt.Errorf("line %d: missing value for %q", lineNo, key)
-			}
-			value, err := unquoteValue(value)
-			if err != nil {
-				return fmt.Errorf("line %d: %w", lineNo, err)
-			}
-			if err := assignRadio(&cfg.Radios[currentRadio], key, value); err != nil {
-				return fmt.Errorf("line %d: %w", lineNo, err)
-			}
-			continue
-		}
-		if section == "radios" && indent == 4 {
-			if currentRadio < 0 {
-				return fmt.Errorf("line %d: radio field has no list item", lineNo)
-			}
-			key, value, ok := strings.Cut(line, ":")
-			if !ok {
-				return fmt.Errorf("line %d: expected key: value", lineNo)
-			}
-			key = strings.TrimSpace(key)
-			value = strings.TrimSpace(value)
-			if value == "" {
-				return fmt.Errorf("line %d: missing value for %q", lineNo, key)
-			}
-			value, err := unquoteValue(value)
-			if err != nil {
-				return fmt.Errorf("line %d: %w", lineNo, err)
-			}
-			if err := assignRadio(&cfg.Radios[currentRadio], key, value); err != nil {
-				return fmt.Errorf("line %d: %w", lineNo, err)
-			}
-			continue
-		}
-		if section == "radios" && indent != 0 {
-			return fmt.Errorf("line %d: invalid radios indentation", lineNo)
-		}
-		key, value, ok := strings.Cut(line, ":")
-		if !ok {
-			return fmt.Errorf("line %d: expected key: value", lineNo)
-		}
-		key = strings.TrimSpace(key)
-		value = strings.TrimSpace(value)
-		if key == "" {
-			return fmt.Errorf("line %d: empty key", lineNo)
-		}
-
-		if indent == 0 && value == "" {
-			if key != "server" && key != "worker" && key != "radios" && key != "suno" {
-				return fmt.Errorf("line %d: unknown section %q", lineNo, key)
-			}
-			section = key
-			currentRadio = -1
-			continue
-		}
-		if indent == 0 {
-			section = ""
-			currentRadio = -1
-		}
-		if indent == 2 && section == "" {
-			return fmt.Errorf("line %d: nested key %q has no section", lineNo, key)
-		}
-		if indent == 4 {
-			return fmt.Errorf("line %d: four-space indentation is only valid in radios", lineNo)
-		}
-		if value == "" {
-			return fmt.Errorf("line %d: missing value for %q", lineNo, key)
-		}
-		value, err := unquoteValue(value)
-		if err != nil {
-			return fmt.Errorf("line %d: %w", lineNo, err)
-		}
-
-		fullKey := key
-		if indent == 2 {
-			fullKey = section + "." + key
-		}
-		if err := assign(cfg, fullKey, value); err != nil {
-			return fmt.Errorf("line %d: %w", lineNo, err)
-		}
-	}
-	if err := scanner.Err(); err != nil {
+func parseYAML(b []byte, cfg *File) error {
+	var raw rawFile
+	if err := yaml.Load(b, &raw, yaml.WithKnownFields()); err != nil {
 		return err
 	}
-	return nil
-}
-
-func stripComment(s string) string {
-	inSingle := false
-	inDouble := false
-	escaped := false
-	for i, r := range s {
-		switch {
-		case escaped:
-			escaped = false
-		case inDouble && r == '\\':
-			escaped = true
-		case !inDouble && r == '\'':
-			inSingle = !inSingle
-		case !inSingle && r == '"':
-			inDouble = !inDouble
-		case !inSingle && !inDouble && r == '#':
-			return s[:i]
-		}
+	if raw.DataDir != nil {
+		cfg.DataDir = *raw.DataDir
 	}
-	return s
-}
-
-func unquoteValue(value string) (string, error) {
-	if strings.HasPrefix(value, `"`) {
-		out, err := strconv.Unquote(value)
-		if err != nil {
-			return "", fmt.Errorf("invalid quoted value %q", value)
-		}
-		return out, nil
+	if raw.GapFrames != nil {
+		cfg.GapFrames = *raw.GapFrames
 	}
-	if strings.HasPrefix(value, "'") {
-		if !strings.HasSuffix(value, "'") || len(value) == 1 {
-			return "", fmt.Errorf("invalid quoted value %q", value)
-		}
-		return strings.ReplaceAll(value[1:len(value)-1], "''", "'"), nil
-	}
-	return value, nil
-}
-
-func assign(cfg *File, key, value string) error {
-	switch key {
-	case "data_dir":
-		cfg.DataDir = value
-	case "gap_frames":
-		n, err := strconv.ParseInt(value, 10, 64)
-		if err != nil {
-			return fmt.Errorf("gap_frames must be an integer")
-		}
-		cfg.GapFrames = n
-	case "log_level":
-		level, err := parseLogLevel(value)
+	if raw.LogLevel != nil {
+		level, err := parseLogLevel(*raw.LogLevel)
 		if err != nil {
 			return err
 		}
 		cfg.LogLevel = level
-	case "server.addr":
-		cfg.Server.Addr = value
-	case "server.schedule_interval":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("server.schedule_interval must be a Go duration")
+	}
+	if raw.Server.Addr != nil {
+		cfg.Server.Addr = *raw.Server.Addr
+	}
+	if err := parseOptionalDuration(raw.Server.ScheduleInterval, "server.schedule_interval", &cfg.Server.ScheduleInterval); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(raw.Server.StreamChunkWindow, "server.stream_chunk_window", &cfg.Server.StreamChunkWindow); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(raw.Server.StreamBufferWindow, "server.stream_buffer_window", &cfg.Server.StreamBufferWindow); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(raw.Server.StreamWriteTimeout, "server.stream_write_timeout", &cfg.Server.StreamWriteTimeout); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(raw.Suno.SyncInterval, "suno.sync_interval", &cfg.Suno.SyncInterval); err != nil {
+		return err
+	}
+	if err := parseOptionalDuration(raw.Suno.HTTPTimeout, "suno.http_timeout", &cfg.Suno.HTTPTimeout); err != nil {
+		return err
+	}
+	if raw.Worker.InboxDir != nil {
+		cfg.Worker.InboxDir = *raw.Worker.InboxDir
+	}
+	if err := parseOptionalDuration(raw.Worker.RescanInterval, "worker.rescan_interval", &cfg.Worker.RescanInterval); err != nil {
+		return err
+	}
+	if raw.Radios != nil {
+		cfg.Radios = make([]Radio, 0, len(raw.Radios))
+		for _, r := range raw.Radios {
+			cfg.Radios = append(cfg.Radios, Radio{Alias: r.Alias, UUID: r.UUID})
 		}
-		cfg.Server.ScheduleInterval = d
-	case "server.stream_chunk_window":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("server.stream_chunk_window must be a Go duration")
-		}
-		cfg.Server.StreamChunkWindow = d
-	case "server.stream_buffer_window":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("server.stream_buffer_window must be a Go duration")
-		}
-		cfg.Server.StreamBufferWindow = d
-	case "server.stream_write_timeout":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("server.stream_write_timeout must be a Go duration")
-		}
-		cfg.Server.StreamWriteTimeout = d
-	case "suno.sync_interval":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("suno.sync_interval must be a Go duration")
-		}
-		cfg.Suno.SyncInterval = d
-	case "suno.http_timeout":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("suno.http_timeout must be a Go duration")
-		}
-		cfg.Suno.HTTPTimeout = d
-	case "worker.inbox_dir":
-		cfg.Worker.InboxDir = value
-	case "worker.rescan_interval":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("worker.rescan_interval must be a Go duration")
-		}
-		cfg.Worker.RescanInterval = d
-	default:
-		return fmt.Errorf("unknown key %q", key)
 	}
 	return nil
 }
 
-func assignRadio(r *Radio, key, value string) error {
-	switch key {
-	case "alias":
-		r.Alias = value
-	case "uuid":
-		r.UUID = value
-	default:
-		return fmt.Errorf("unknown radio key %q", key)
+func parseOptionalDuration(raw *string, name string, out *time.Duration) error {
+	if raw == nil {
+		return nil
 	}
+	d, err := time.ParseDuration(*raw)
+	if err != nil {
+		return fmt.Errorf("%s must be a Go duration", name)
+	}
+	*out = d
 	return nil
 }
 

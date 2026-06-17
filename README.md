@@ -48,10 +48,11 @@ from disk.
 - A C compiler usable by Go. In the provided devcontainer, `go env CC` points to
   `zig cc -target x86_64-linux-gnu`.
 
-The only third-party Go dependency is:
+Third-party Go dependencies:
 
 ```text
 github.com/mattn/go-sqlite3 v1.14.44
+go.yaml.in/yaml/v4 v4.0.0-rc.5
 ```
 
 ## Quick Start

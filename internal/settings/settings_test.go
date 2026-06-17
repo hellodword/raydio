@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -165,6 +166,47 @@ func TestLoadRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsUnknownNestedKeys(t *testing.T) {
+	tests := []string{
+		`server:
+  typo: true
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`,
+		`radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+    typo: true
+`,
+	}
+	for _, body := range tests {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("expected unknown nested key to fail: %s", body)
+		}
+	}
+}
+
+func TestLoadRejectsDuplicateKeys(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+data_dir: /srv/one
+data_dir: /srv/two
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected duplicate key to fail")
+	}
+}
+
 func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte("log_level: trace\n"), 0o644); err != nil {
@@ -172,6 +214,51 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected invalid log level to fail")
+	}
+}
+
+func TestLoadRejectsInvalidDuration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+server:
+  schedule_interval: soon
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected invalid duration to fail")
+	}
+	if !strings.Contains(err.Error(), "server.schedule_interval must be a Go duration") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadParsesStandardYAMLFlowStyle(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+data_dir: /srv/raydio
+server: {addr: ":18080", schedule_interval: 250ms}
+radios: [{alias: monthly, uuid: "00000000-0000-0000-0000-000000000001"}]
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server.Addr != ":18080" {
+		t.Fatalf("Server.Addr = %q", cfg.Server.Addr)
+	}
+	if cfg.Server.ScheduleInterval != 250*time.Millisecond {
+		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
+	}
+	if len(cfg.Radios) != 1 || cfg.Radios[0].Alias != "monthly" {
+		t.Fatalf("Radios = %+v", cfg.Radios)
 	}
 }
 
