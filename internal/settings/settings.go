@@ -19,6 +19,7 @@ type File struct {
 	LogLevel  slog.Level
 	Radios    []Radio
 	Server    Server
+	Suno      Suno
 	Worker    Worker
 }
 
@@ -33,6 +34,11 @@ type Server struct {
 	StreamChunkWindow  time.Duration
 	StreamBufferWindow time.Duration
 	StreamWriteTimeout time.Duration
+}
+
+type Suno struct {
+	SyncInterval time.Duration
+	HTTPTimeout  time.Duration
 }
 
 type Worker struct {
@@ -51,6 +57,10 @@ func Defaults() File {
 			StreamChunkWindow:  480 * time.Millisecond,
 			StreamBufferWindow: 2 * time.Second,
 			StreamWriteTimeout: 5 * time.Second,
+		},
+		Suno: Suno{
+			SyncInterval: 30 * time.Minute,
+			HTTPTimeout:  30 * time.Second,
 		},
 		Worker: Worker{
 			RescanInterval: 30 * time.Second,
@@ -175,7 +185,7 @@ func parseYAMLSubset(b []byte, cfg *File) error {
 		}
 
 		if indent == 0 && value == "" {
-			if key != "server" && key != "worker" && key != "radios" {
+			if key != "server" && key != "worker" && key != "radios" && key != "suno" {
 				return fmt.Errorf("line %d: unknown section %q", lineNo, key)
 			}
 			section = key
@@ -294,6 +304,18 @@ func assign(cfg *File, key, value string) error {
 			return fmt.Errorf("server.stream_write_timeout must be a Go duration")
 		}
 		cfg.Server.StreamWriteTimeout = d
+	case "suno.sync_interval":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("suno.sync_interval must be a Go duration")
+		}
+		cfg.Suno.SyncInterval = d
+	case "suno.http_timeout":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("suno.http_timeout must be a Go duration")
+		}
+		cfg.Suno.HTTPTimeout = d
 	case "worker.inbox_dir":
 		cfg.Worker.InboxDir = value
 	case "worker.rescan_interval":
@@ -322,7 +344,7 @@ func assignRadio(r *Radio, key, value string) error {
 
 var (
 	uuidPattern  = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	aliasPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+	aliasPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9 _&-]*[A-Za-z0-9])?$`)
 )
 
 func validateRadios(cfg *File) error {
@@ -339,7 +361,7 @@ func validateRadios(cfg *File) error {
 			return fmt.Errorf("radio %d alias is required", i+1)
 		}
 		if !aliasPattern.MatchString(r.Alias) {
-			return fmt.Errorf("radio %q alias must use lowercase letters, numbers, and hyphens", r.Alias)
+			return fmt.Errorf("radio %q alias must use letters, numbers, spaces, underscores, ampersands, and hyphens", r.Alias)
 		}
 		if uuidPattern.MatchString(r.Alias) {
 			return fmt.Errorf("radio alias %q must not look like a uuid", r.Alias)

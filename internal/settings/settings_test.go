@@ -27,6 +27,10 @@ worker:
   inbox_dir: '/music inbox'
   rescan_interval: 2s
 
+suno:
+  sync_interval: 45m
+  http_timeout: 12s
+
 radios:
   - alias: monthly
     uuid: "00000000-0000-0000-0000-000000000001"
@@ -67,6 +71,12 @@ radios:
 	}
 	if cfg.Worker.RescanInterval != 2*time.Second {
 		t.Fatalf("Worker.RescanInterval = %s", cfg.Worker.RescanInterval)
+	}
+	if cfg.Suno.SyncInterval != 45*time.Minute {
+		t.Fatalf("Suno.SyncInterval = %s", cfg.Suno.SyncInterval)
+	}
+	if cfg.Suno.HTTPTimeout != 12*time.Second {
+		t.Fatalf("Suno.HTTPTimeout = %s", cfg.Suno.HTTPTimeout)
 	}
 	if len(cfg.Radios) != 1 || cfg.Radios[0].Alias != "monthly" || cfg.Radios[0].UUID != "00000000-0000-0000-0000-000000000001" {
 		t.Fatalf("Radios = %+v", cfg.Radios)
@@ -110,6 +120,12 @@ radios:
 	}
 	if cfg.Worker.RescanInterval != 30*time.Second {
 		t.Fatalf("Worker.RescanInterval = %s", cfg.Worker.RescanInterval)
+	}
+	if cfg.Suno.SyncInterval != 30*time.Minute {
+		t.Fatalf("Suno.SyncInterval = %s", cfg.Suno.SyncInterval)
+	}
+	if cfg.Suno.HTTPTimeout != 30*time.Second {
+		t.Fatalf("Suno.HTTPTimeout = %s", cfg.Suno.HTTPTimeout)
 	}
 }
 
@@ -162,7 +178,7 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 func TestLoadRejectsInvalidRadios(t *testing.T) {
 	tests := []string{
 		`radios:
-  - alias: Monthly
+  - alias: bad/alias
     uuid: "00000000-0000-0000-0000-000000000001"
 `,
 		`radios:

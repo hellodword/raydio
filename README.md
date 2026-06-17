@@ -5,10 +5,12 @@ MP3 directories into shared, always-moving radio timelines. Every listener that
 opens the same `/radio/<uuid-or-alias>` path hears the same track at the same
 position, based on server time.
 
-Raydio runs as two processes:
+Raydio runs as three processes:
 
 - `raydio-worker` scans the inbox and performs all ffmpeg/ffprobe/media
   preprocessing.
+- `suno-worker` optionally syncs configured Suno playlists into each station
+  inbox.
 - `raydio` serves HTTP, APIs, metadata, and cached MP3 frame ranges.
 
 The HTTP server never runs ffmpeg or ffprobe and does not decode audio while
@@ -34,6 +36,7 @@ from disk.
   - no Xing header
   - fixed 576-byte MP3 frames
 - Worker directory scanner for adding and removing tracks.
+- Optional Suno playlist sync worker.
 - Sidecar metadata support for title, artist, album, lyrics, and cover art.
 - Silence fallback when the catalog is empty.
 
@@ -65,6 +68,12 @@ Start the worker in one terminal:
 CGO_ENABLED=1 go run ./cmd/raydio-worker
 ```
 
+Optionally start the Suno sync worker in another terminal:
+
+```bash
+CGO_ENABLED=1 go run ./cmd/suno-worker
+```
+
 Start the HTTP server in another terminal:
 
 ```bash
@@ -94,7 +103,7 @@ against the same data directory.
 
 ## Command-Line Flags
 
-Both binaries intentionally expose only the config path and help flags:
+All binaries intentionally expose only the config path and help flags:
 
 | Flag | Default | Description |
 | --- | --- | --- |
@@ -107,6 +116,7 @@ Example:
 
 ```bash
 CGO_ENABLED=1 go run ./cmd/raydio-worker -config /srv/raydio/config.yaml
+CGO_ENABLED=1 go run ./cmd/suno-worker -config /srv/raydio/config.yaml
 CGO_ENABLED=1 go run ./cmd/raydio -config /srv/raydio/config.yaml
 ```
 
@@ -125,14 +135,16 @@ Supported keys:
 | --- | --- | --- |
 | `data_dir` | `./data` | Root data directory. |
 | `gap_frames` | `209` | Silence frames inserted between tracks. |
-| `log_level` | `DEBUG` | Minimum structured log level for both binaries. |
-| `radios[].alias` | none | Human-readable radio path alias. Lowercase letters, numbers, and hyphens only. |
+| `log_level` | `DEBUG` | Minimum structured log level for all binaries. |
+| `radios[].alias` | none | Human-readable radio path alias. Letters, numbers, spaces, underscores, ampersands, and hyphens only. |
 | `radios[].uuid` | none | Canonical radio UUID. Worker scans `<worker.inbox_dir>/<uuid>`. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
 | `server.stream_chunk_window` | `480ms` | Shared audio chunk size produced once and fanned out to listeners. |
 | `server.stream_buffer_window` | `2s` | Live catch-up window for slow listeners. |
 | `server.stream_write_timeout` | `5s` | Maximum blocking time for a listener write. |
+| `suno.sync_interval` | `30m` | How often `suno-worker` syncs configured Suno playlists. |
+| `suno.http_timeout` | `30s` | HTTP timeout for Suno playlist and media downloads. |
 | `worker.inbox_dir` | empty | Base source MP3 directory. Empty means `<data_dir>/inbox`. |
 | `worker.rescan_interval` | `30s` | Directory rescan interval. |
 
@@ -146,7 +158,7 @@ Log level values are `DEBUG`, `INFO`, `WARN`, or `ERROR`.
 
 ## Logging
 
-Raydio uses Go `slog` structured text logs on stderr. Both binaries use the same
+Raydio uses Go `slog` structured text logs on stderr. All binaries use the same
 `log_level` value from the config file. The example config defaults to `DEBUG`
 so development runs include startup settings, schedule ticks, stream lifecycle
 events, and worker scan summaries.
@@ -192,6 +204,21 @@ Lyrics use LRC timestamps, for example:
 [00:12.000]First lyric line
 [00:18.500]Second lyric line
 ```
+
+### Suno Sync
+
+`suno-worker` treats each configured `radios[].uuid` as a Suno playlist UUID and
+requests:
+
+```text
+https://studio-api-prod.suno.com/api/playlist/<uuid>
+```
+
+Only clips with `clip.status == "complete"` are downloaded. For each clip,
+`suno-worker` writes the MP3, a sidecar JSON file with title and artist, and the
+cover image into `<worker.inbox_dir>/<uuid>`. It keeps a `.suno-manifest.json`
+file and removes only stale files it previously managed; manual inbox files are
+not deleted. `raydio-worker` then imports those files through the normal scanner.
 
 ## HTTP Endpoints
 
@@ -413,6 +440,9 @@ server:
   stream_chunk_window: 480ms
   stream_buffer_window: 2s
   stream_write_timeout: 5s
+suno:
+  sync_interval: 30m
+  http_timeout: 30s
 worker:
   inbox_dir: ""
   rescan_interval: 30s
