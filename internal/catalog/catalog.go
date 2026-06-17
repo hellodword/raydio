@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"raydio/internal/audio"
+	"raydio/internal/paths"
 	"raydio/internal/store"
 )
 
@@ -57,17 +57,11 @@ func New(cfg Config, st *store.Store) *Service {
 }
 
 func (s *Service) SilencePath() string {
-	return filepath.Join(s.cfg.CacheDir, "silence", fmt.Sprintf("silence-%dframes.mp3", s.cfg.SilenceFrames))
+	return paths.SilencePath(s.cfg.CacheDir, s.cfg.SilenceFrames)
 }
 
 func (s *Service) EnsureDirs(ctx context.Context) error {
-	dirs := []string{
-		s.cfg.InboxDir,
-		filepath.Join(s.cfg.CacheDir, "tracks"),
-		filepath.Join(s.cfg.CacheDir, "covers"),
-		filepath.Join(s.cfg.CacheDir, "lyrics"),
-		filepath.Join(s.cfg.CacheDir, "silence"),
-	}
+	dirs := append([]string{s.cfg.InboxDir}, paths.CacheDirs(s.cfg.CacheDir)...)
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err

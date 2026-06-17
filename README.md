@@ -1,36 +1,45 @@
 # Raydio
 
-Raydio is a single-instance web radio server written in Go. It turns a directory
+Raydio is a single-instance web radio system written in Go. It turns a directory
 of MP3 files into one shared, always-moving radio timeline. Every listener that
 opens `/radio` hears the same track at the same position, based on server time.
 
-The server does not run ffmpeg per listener and does not decode audio while
-streaming. Source files are normalized once into clean constant-bitrate MP3
-files, then the HTTP stream sends MP3 frame ranges directly from disk.
+Raydio runs as two processes:
+
+- `raydio-worker` scans the inbox and performs all ffmpeg/ffprobe/media
+  preprocessing.
+- `raydio` serves HTTP, APIs, metadata, and cached MP3 frame ranges.
+
+The HTTP server never runs ffmpeg or ffprobe and does not decode audio while
+streaming. Source files are normalized once by the worker into clean
+constant-bitrate MP3 files, then the HTTP stream sends MP3 frame ranges directly
+from disk.
 
 ## Features
 
 - Global live radio timeline shared by all listeners.
 - Background schedule maintenance, even when nobody is listening.
+- Separate media worker for scanner, ffmpeg, ffprobe, cache validation, and
+  asset extraction.
 - Infinite `audio/mpeg` stream at `GET /radio`.
 - Browser player at `GET /` with play, pause, volume, current track, cover, and
   lyric display.
 - SQLite catalog and persistent schedule.
-- Offline ffmpeg preprocessing into clean MP3:
+- Worker-owned ffmpeg preprocessing into clean MP3:
   - 48 kHz
   - stereo
   - 192 kbps CBR
   - no ID3 header
   - no Xing header
   - fixed 576-byte MP3 frames
-- Directory scanner for adding and removing tracks.
+- Worker directory scanner for adding and removing tracks.
 - Sidecar metadata support for title, artist, album, lyrics, and cover art.
 - Silence fallback when the catalog is empty.
 
 ## Requirements
 
 - Go 1.26 or newer.
-- `ffmpeg` and `ffprobe` available on `PATH`.
+- `ffmpeg` and `ffprobe` available on `PATH` for `raydio-worker`.
 - CGO enabled for SQLite.
 - A C compiler usable by Go. In the provided devcontainer, `go env CC` points to
   `zig cc -target x86_64-linux-gnu`.
@@ -43,7 +52,13 @@ github.com/mattn/go-sqlite3 v1.14.44
 
 ## Quick Start
 
-Build and run:
+Start the worker in one terminal:
+
+```bash
+CGO_ENABLED=1 go run ./cmd/raydio-worker
+```
+
+Start the HTTP server in another terminal:
 
 ```bash
 CGO_ENABLED=1 go run ./cmd/raydio
@@ -61,20 +76,33 @@ Add MP3 files to:
 ./data/inbox
 ```
 
-Raydio scans on startup and then rescans every 30 seconds by default. It also
-maintains the future radio schedule every minute by default, even with zero
-listeners. Converted audio, covers, lyrics, the silence file, and the SQLite
-database are stored under `./data`.
+`raydio-worker` scans on startup and then rescans every 30 seconds by default.
+`raydio` maintains the future radio schedule every minute by default, even with
+zero listeners. Converted audio, covers, lyrics, the silence file, and the
+SQLite database are stored under `./data`.
+
+`raydio` expects the worker to have prepared the cache and silence MP3. If the
+cache is missing, the server fails startup with guidance to run `raydio-worker`
+against the same data directory.
 
 ## Command-Line Flags
+
+### Server: `raydio`
 
 | Flag | Environment variable | Default | Description |
 | --- | --- | --- | --- |
 | `-addr` | `RAYDIO_ADDR` | `:8080` | HTTP listen address. |
 | `-data` | `RAYDIO_DATA` | `./data` | Root data directory. |
+| `-schedule` | `RAYDIO_SCHEDULE` | `1m` | Background schedule maintenance interval. |
+| `-gap-frames` | `RAYDIO_GAP_FRAMES` | `209` | Silence frames inserted between tracks. |
+
+### Worker: `raydio-worker`
+
+| Flag | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `-data` | `RAYDIO_DATA` | `./data` | Root data directory. |
 | `-inbox` | `RAYDIO_INBOX` | `<data>/inbox` | Source MP3 directory. |
 | `-rescan` | `RAYDIO_RESCAN` | `30s` | Directory rescan interval. |
-| `-schedule` | `RAYDIO_SCHEDULE` | `1m` | Background schedule maintenance interval. |
 | `-gap-frames` | `RAYDIO_GAP_FRAMES` | `209` | Silence frames inserted between tracks. |
 
 At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
@@ -83,17 +111,20 @@ At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
 Example:
 
 ```bash
+CGO_ENABLED=1 go run ./cmd/raydio-worker \
+  -data /srv/raydio \
+  -rescan 15s
+
 CGO_ENABLED=1 go run ./cmd/raydio \
   -addr 127.0.0.1:8080 \
   -data /srv/raydio \
-  -rescan 15s \
   -schedule 1m
 ```
 
 ## Input Files and Metadata
 
-Raydio processes stable `.mp3` files in the inbox directory. Hidden files,
-`.tmp` files, and `.part` files are ignored.
+`raydio-worker` processes stable `.mp3` files in the inbox directory. Hidden
+files, `.tmp` files, and `.part` files are ignored.
 
 Metadata priority:
 
@@ -160,8 +191,8 @@ It intentionally has no `Content-Length` and does not support seeking.
 ### Audio preprocessing
 
 Source MP3 files can be VBR, can contain metadata headers, and can have variable
-frame sizes. That makes direct time-to-byte seeking unreliable. Raydio therefore
-normalizes every source file once with ffmpeg:
+frame sizes. That makes direct time-to-byte seeking unreliable. `raydio-worker`
+therefore normalizes every source file once with ffmpeg:
 
 ```bash
 ffmpeg -nostdin -hide_banner -loglevel error \
@@ -219,6 +250,32 @@ continues streaming valid MP3 audio.
 When all listeners disconnect, no audio is played in the background. Raydio only
 continues maintaining schedule rows. The next listener joins the current
 wall-clock slot and frame.
+
+### Worker and Server Split
+
+`raydio-worker` owns every expensive or externally executed media task:
+
+- inbox scan and file stability checks
+- source hashing
+- ffprobe metadata extraction
+- ffmpeg transcode
+- clean MP3 validation
+- silence MP3 generation
+- embedded cover extraction
+- sidecar lyrics/cover copy
+- track and asset DB updates
+- future schedule invalidation after catalog changes
+
+`raydio` owns only:
+
+- HTTP server
+- `/radio` cached-frame streaming
+- metadata APIs and static assets
+- background schedule maintenance
+
+Both processes use the same SQLite database and the same data/cache directory.
+This lets deployments apply Docker CPU/memory/I/O limits to `raydio-worker`
+without throttling active listeners.
 
 ### Streaming
 
@@ -293,6 +350,7 @@ Run with sample files:
 ```bash
 mkdir -p /tmp/raydio-demo/data/inbox
 cp tmp/origin/*.mp3 /tmp/raydio-demo/data/inbox/
+CGO_ENABLED=1 go run ./cmd/raydio-worker -data /tmp/raydio-demo/data
 CGO_ENABLED=1 go run ./cmd/raydio -addr 127.0.0.1:18080 -data /tmp/raydio-demo/data
 ```
 
@@ -312,6 +370,7 @@ ffprobe -v error -show_format -show_streams /tmp/raydio-sample.mp3
 ## Limitations
 
 - Single-instance only.
+- Single catalog worker only.
 - No admin UI.
 - No write API for metadata.
 - No HLS.

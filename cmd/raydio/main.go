@@ -12,12 +12,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
-	"raydio/internal/catalog"
+	"raydio/internal/paths"
 	"raydio/internal/radio"
 	"raydio/internal/store"
 	"raydio/web"
@@ -26,10 +25,8 @@ import (
 type config struct {
 	Addr             string
 	DataDir          string
-	InboxDir         string
 	CacheDir         string
 	DBPath           string
-	RescanInterval   time.Duration
 	ScheduleInterval time.Duration
 	GapFrames        int64
 }
@@ -37,7 +34,6 @@ type config struct {
 type app struct {
 	cfg       config
 	store     *store.Store
-	catalog   *catalog.Service
 	scheduler *radio.Scheduler
 }
 
@@ -55,16 +51,12 @@ func readConfig() config {
 	var cfg config
 	flag.StringVar(&cfg.Addr, "addr", env("RAYDIO_ADDR", ":8080"), "HTTP listen address")
 	flag.StringVar(&cfg.DataDir, "data", env("RAYDIO_DATA", "./data"), "data directory")
-	flag.StringVar(&cfg.InboxDir, "inbox", env("RAYDIO_INBOX", ""), "inbox directory")
-	flag.DurationVar(&cfg.RescanInterval, "rescan", envDuration("RAYDIO_RESCAN", 30*time.Second), "rescan interval")
 	flag.DurationVar(&cfg.ScheduleInterval, "schedule", envDuration("RAYDIO_SCHEDULE", time.Minute), "schedule maintenance interval")
 	flag.Int64Var(&cfg.GapFrames, "gap-frames", envInt64("RAYDIO_GAP_FRAMES", 209), "silence gap frame count")
 	flag.Parse()
-	if cfg.InboxDir == "" {
-		cfg.InboxDir = filepath.Join(cfg.DataDir, "inbox")
-	}
-	cfg.CacheDir = filepath.Join(cfg.DataDir, "cache")
-	cfg.DBPath = filepath.Join(cfg.DataDir, "raydio.sqlite")
+	layout := paths.New(cfg.DataDir, "")
+	cfg.CacheDir = layout.CacheDir
+	cfg.DBPath = layout.DBPath
 	return cfg
 }
 
@@ -72,7 +64,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
+	if err := paths.RequireServerCache(cfg.CacheDir, cfg.GapFrames); err != nil {
 		return err
 	}
 	st, err := store.Open(ctx, cfg.DBPath)
@@ -81,21 +73,12 @@ func run(ctx context.Context, cfg config) error {
 	}
 	defer st.Close()
 
-	cat := catalog.New(catalog.Config{
-		InboxDir:      cfg.InboxDir,
-		CacheDir:      cfg.CacheDir,
-		SilenceFrames: cfg.GapFrames,
-	}, st)
-	if _, err := cat.Scan(ctx); err != nil {
-		return err
-	}
-	scheduler := radio.NewScheduler(st, cat.SilencePath(), cfg.GapFrames)
+	scheduler := radio.NewScheduler(st, paths.SilencePath(cfg.CacheDir, cfg.GapFrames), cfg.GapFrames)
 	if err := scheduler.Ensure(ctx, time.Now()); err != nil {
 		return err
 	}
 
-	a := &app{cfg: cfg, store: st, catalog: cat, scheduler: scheduler}
-	go a.scanLoop(ctx)
+	a := &app{cfg: cfg, store: st, scheduler: scheduler}
 	go a.scheduleLoop(ctx)
 
 	mux := http.NewServeMux()
@@ -126,9 +109,6 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func validateConfig(cfg config) error {
-	if cfg.RescanInterval <= 0 {
-		return fmt.Errorf("rescan interval must be positive")
-	}
 	if cfg.ScheduleInterval <= 0 {
 		return fmt.Errorf("schedule interval must be positive")
 	}
@@ -149,34 +129,6 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /covers/{id}", a.handleAsset("cover"))
 	mux.HandleFunc("GET /lyrics/{id}", a.handleAsset("lyrics"))
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
-}
-
-func (a *app) scanLoop(ctx context.Context) {
-	ticker := time.NewTicker(a.cfg.RescanInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if result, err := a.catalog.Scan(ctx); err != nil {
-				log.Printf("scan failed: %v", err)
-			} else {
-				a.handleScanResult(ctx, result)
-			}
-		}
-	}
-}
-
-func (a *app) handleScanResult(ctx context.Context, result catalog.ScanResult) {
-	if result.Changed {
-		if err := a.scheduler.Ensure(ctx, time.Now()); err != nil {
-			log.Printf("schedule refill after scan failed: %v", err)
-		}
-	}
-	if result.Changed || result.Errors > 0 {
-		log.Printf("scan seen=%d processed=%d skipped=%d errors=%d changed=%t", result.Seen, result.Processed, result.Skipped, result.Errors, result.Changed)
-	}
 }
 
 func (a *app) scheduleLoop(ctx context.Context) {

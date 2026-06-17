@@ -2,23 +2,87 @@ package main
 
 import (
 	"context"
+	"errors"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"raydio/internal/catalog"
+	"raydio/internal/audio"
+	"raydio/internal/paths"
 	"raydio/internal/radio"
 	"raydio/internal/store"
 )
 
 func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	cfg := config{
-		RescanInterval:   time.Second,
 		ScheduleInterval: 0,
 		GapFrames:        1,
 	}
 	if err := validateConfig(cfg); err == nil {
 		t.Fatal("expected non-positive schedule interval to fail validation")
+	}
+}
+
+func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	layout := paths.New(dir, "")
+	err := run(ctx, config{
+		Addr:             "127.0.0.1:0",
+		DataDir:          dir,
+		CacheDir:         layout.CacheDir,
+		DBPath:           layout.DBPath,
+		ScheduleInterval: time.Second,
+		GapFrames:        5,
+	})
+	if err == nil {
+		t.Fatal("expected missing worker-prepared cache to fail startup")
+	}
+	if !strings.Contains(err.Error(), "run raydio-worker") {
+		t.Fatalf("error = %q, want raydio-worker guidance", err)
+	}
+}
+
+func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
+	requireFFmpeg(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dir := t.TempDir()
+	layout := paths.New(dir, "")
+	for _, dir := range append([]string{layout.CacheDir}, paths.CacheDirs(layout.CacheDir)...) {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := audio.EnsureSilence(ctx, paths.SilencePath(layout.CacheDir, 5), 5); err != nil {
+		t.Fatal(err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, config{
+			Addr:             "127.0.0.1:0",
+			DataDir:          dir,
+			CacheDir:         layout.CacheDir,
+			DBPath:           layout.DBPath,
+			ScheduleInterval: 5 * time.Millisecond,
+			GapFrames:        5,
+		})
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server did not stop after context cancellation")
 	}
 }
 
@@ -44,26 +108,6 @@ func TestScheduleLoopMaintainsFutureSlots(t *testing.T) {
 	})
 }
 
-func TestHandleScanResultRefillsFutureSchedule(t *testing.T) {
-	ctx := context.Background()
-	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-
-	a := &app{scheduler: radio.NewScheduler(st, "/cache/silence.mp3", 5)}
-	a.handleScanResult(ctx, catalog.ScanResult{Changed: true})
-
-	slots, err := st.SlotsEndingAfter(ctx, time.Now().UnixMilli())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(slots) == 0 {
-		t.Fatal("expected scan change handling to refill future schedule")
-	}
-}
-
 func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -74,4 +118,14 @@ func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met before timeout")
+}
+
+func requireFFmpeg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg unavailable")
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe unavailable")
+	}
 }
