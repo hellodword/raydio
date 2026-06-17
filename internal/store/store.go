@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/pressly/goose/v3"
 )
 
 const (
@@ -21,6 +23,9 @@ const (
 type Store struct {
 	db *sql.DB
 }
+
+//go:embed migrations/*.sql
+var migrationFS embed.FS
 
 type CatalogRevision struct {
 	Revision  int64
@@ -42,7 +47,6 @@ type CatalogTrack struct {
 	Album      string `json:"album,omitempty"`
 	DurationMs int64  `json:"durationMs"`
 	CoverURL   string `json:"coverUrl,omitempty"`
-	LyricsURL  string `json:"lyricsUrl,omitempty"`
 }
 
 type Track struct {
@@ -56,7 +60,6 @@ type Track struct {
 	Title         string         `json:"title"`
 	Artist        string         `json:"artist"`
 	Album         string         `json:"album,omitempty"`
-	Comment       string         `json:"comment,omitempty"`
 	DurationMs    int64          `json:"durationMs"`
 	FrameCount    int64          `json:"frameCount"`
 	FrameSize     int64          `json:"frameSize"`
@@ -139,196 +142,47 @@ func (s *Store) configure(ctx context.Context) error {
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
-	schema := []string{
-		`CREATE TABLE IF NOT EXISTS schema_migrations (
-			version INTEGER PRIMARY KEY,
-			applied_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS stations (
-			uuid TEXT PRIMARY KEY,
-			alias TEXT NOT NULL UNIQUE,
-			enabled INTEGER NOT NULL,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS tracks (
-			id TEXT PRIMARY KEY,
-			station_uuid TEXT NOT NULL,
-			content_hash TEXT NOT NULL,
-			source_path TEXT NOT NULL,
-			source_size INTEGER NOT NULL,
-			source_mod_unix INTEGER NOT NULL,
-			cache_path TEXT NOT NULL,
-			title TEXT NOT NULL,
-			artist TEXT NOT NULL,
-			album TEXT NOT NULL DEFAULT '',
-			comment TEXT NOT NULL DEFAULT '',
-			duration_ms INTEGER NOT NULL,
-			frame_count INTEGER NOT NULL,
-			frame_size INTEGER NOT NULL,
-			bitrate INTEGER NOT NULL,
-			sample_rate INTEGER NOT NULL,
-			channels INTEGER NOT NULL,
-			status TEXT NOT NULL,
-			error TEXT,
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL,
-			FOREIGN KEY (station_uuid) REFERENCES stations(uuid)
-		)`,
-		`CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status)`,
-		`DROP INDEX IF EXISTS idx_tracks_source_path`,
-		`DROP INDEX IF EXISTS idx_tracks_source_path_lookup`,
-		`CREATE TABLE IF NOT EXISTS track_assets (
-			track_id TEXT NOT NULL,
-			kind TEXT NOT NULL,
-			path TEXT NOT NULL,
-			mime TEXT NOT NULL,
-			updated_at TEXT NOT NULL DEFAULT '',
-			PRIMARY KEY (track_id, kind),
-			FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
-		)`,
-		`CREATE TABLE IF NOT EXISTS schedule_slots (
-			id TEXT PRIMARY KEY,
-			station_uuid TEXT NOT NULL,
-			start_unix_ms INTEGER NOT NULL,
-			end_unix_ms INTEGER NOT NULL,
-			track_id TEXT,
-			is_silence INTEGER NOT NULL,
-			frame_count INTEGER NOT NULL,
-			created_at TEXT NOT NULL,
-			FOREIGN KEY (station_uuid) REFERENCES stations(uuid),
-			FOREIGN KEY (track_id) REFERENCES tracks(id)
-		)`,
-		`DROP INDEX IF EXISTS idx_schedule_slots_time`,
-		`DROP INDEX IF EXISTS idx_schedule_slots_end`,
-		`CREATE INDEX IF NOT EXISTS idx_tracks_title_nocase ON tracks(title COLLATE NOCASE, id)`,
-		`DROP INDEX IF EXISTS idx_tracks_status_title_nocase`,
-		`CREATE TABLE IF NOT EXISTS settings (
-			key TEXT PRIMARY KEY,
-			value TEXT NOT NULL,
-			updated_at TEXT NOT NULL
-		)`,
-		`DROP TRIGGER IF EXISTS trg_tracks_catalog_revision_insert`,
-		`DROP TRIGGER IF EXISTS trg_tracks_catalog_revision_update`,
-		`DROP TRIGGER IF EXISTS trg_tracks_catalog_revision_delete`,
-		`DROP TRIGGER IF EXISTS trg_track_assets_catalog_revision_insert`,
-		`DROP TRIGGER IF EXISTS trg_track_assets_catalog_revision_update`,
-		`DROP TRIGGER IF EXISTS trg_track_assets_catalog_revision_delete`,
-	}
-	for _, stmt := range schema {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return err
-		}
-	}
-	for _, col := range []struct {
-		table, column, definition string
-	}{
-		{"tracks", "station_uuid", "TEXT NOT NULL DEFAULT ''"},
-		{"tracks", "content_hash", "TEXT NOT NULL DEFAULT ''"},
-		{"track_assets", "updated_at", "TEXT NOT NULL DEFAULT ''"},
-		{"schedule_slots", "station_uuid", "TEXT NOT NULL DEFAULT ''"},
-	} {
-		if err := s.ensureColumn(ctx, col.table, col.column, col.definition); err != nil {
-			return err
-		}
-	}
-	if ok, err := s.hasColumn(ctx, "catalog_state", "station_uuid"); err != nil {
+	hasGoose, err := s.hasTable(ctx, "goose_db_version")
+	if err != nil {
 		return err
-	} else if !ok {
-		if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS catalog_state`); err != nil {
+	}
+	if !hasGoose {
+		hasTables, err := s.hasUserTables(ctx)
+		if err != nil {
 			return err
 		}
-	}
-	indexSchema := []string{
-		`CREATE INDEX IF NOT EXISTS idx_tracks_source_path_lookup ON tracks(station_uuid, source_path)`,
-		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_time ON schedule_slots(station_uuid, start_unix_ms, end_unix_ms)`,
-		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_end ON schedule_slots(station_uuid, end_unix_ms)`,
-		`CREATE INDEX IF NOT EXISTS idx_tracks_status_title_nocase ON tracks(station_uuid, status, title COLLATE NOCASE, id)`,
-	}
-	for _, stmt := range indexSchema {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return err
+		if hasTables {
+			return errors.New("database has a legacy non-goose schema; remove or recreate the SQLite database before starting this version")
 		}
 	}
-	catalogSchema := []string{
-		`CREATE TABLE IF NOT EXISTS catalog_state (
-			station_uuid TEXT PRIMARY KEY,
-			revision INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT NOT NULL DEFAULT '',
-			FOREIGN KEY (station_uuid) REFERENCES stations(uuid)
-		)`,
-		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_insert
-			AFTER INSERT ON tracks
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = NEW.station_uuid;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_update
-			AFTER UPDATE ON tracks
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = NEW.station_uuid;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_delete
-			AFTER DELETE ON tracks
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = OLD.station_uuid;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_insert
-			AFTER INSERT ON track_assets
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
-				WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = NEW.track_id);
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_update
-			AFTER UPDATE ON track_assets
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
-				WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = NEW.track_id);
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_delete
-			AFTER DELETE ON track_assets
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
-				WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = OLD.track_id);
-			END`,
-		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))`,
+	goose.SetBaseFS(migrationFS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return err
 	}
-	for _, stmt := range catalogSchema {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return err
-		}
-	}
-	return nil
+	return goose.UpContext(ctx, s.db, "migrations")
 }
 
-func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
-	_, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, column, definition))
-	if err == nil {
-		return nil
-	}
-	if strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
-		return nil
-	}
-	return err
+func (s *Store) hasTable(ctx context.Context, name string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&count)
+	return count != 0, err
 }
 
-func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+func (s *Store) hasUserTables(ctx context.Context) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table'`)
 	if err != nil {
 		return false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull int
-		var dflt any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+		var name string
+		if err := rows.Scan(&name); err != nil {
 			return false, err
 		}
-		if name == column {
-			return true, nil
+		if name == "goose_db_version" || strings.HasPrefix(name, "sqlite_") {
+			continue
 		}
+		return true, nil
 	}
 	return false, rows.Err()
 }
@@ -388,10 +242,10 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO tracks (
-		id, station_uuid, content_hash, source_path, source_size, source_mod_unix, cache_path, title, artist, album, comment,
+		id, station_uuid, content_hash, source_path, source_size, source_mod_unix, cache_path, title, artist, album,
 		duration_ms, frame_count, frame_size, bitrate, sample_rate, channels, status, error,
 		created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 		station_uuid=excluded.station_uuid,
 		content_hash=excluded.content_hash,
@@ -402,7 +256,6 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		title=excluded.title,
 		artist=excluded.artist,
 		album=excluded.album,
-		comment=excluded.comment,
 		duration_ms=excluded.duration_ms,
 		frame_count=excluded.frame_count,
 		frame_size=excluded.frame_size,
@@ -421,7 +274,6 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		OR tracks.title IS NOT excluded.title
 		OR tracks.artist IS NOT excluded.artist
 		OR tracks.album IS NOT excluded.album
-		OR tracks.comment IS NOT excluded.comment
 		OR tracks.duration_ms IS NOT excluded.duration_ms
 		OR tracks.frame_count IS NOT excluded.frame_count
 		OR tracks.frame_size IS NOT excluded.frame_size
@@ -430,13 +282,16 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		OR tracks.channels IS NOT excluded.channels
 		OR tracks.status IS NOT excluded.status
 		OR tracks.error IS NOT excluded.error`,
-		t.ID, t.StationUUID, t.ContentHash, t.SourcePath, t.SourceSize, t.SourceModUnix, t.CachePath, t.Title, t.Artist, t.Album, t.Comment,
+		t.ID, t.StationUUID, t.ContentHash, t.SourcePath, t.SourceSize, t.SourceModUnix, t.CachePath, t.Title, t.Artist, t.Album,
 		t.DurationMs, t.FrameCount, t.FrameSize, t.Bitrate, t.SampleRate, t.Channels, t.Status, t.Error,
 		now, now)
 	return err
 }
 
 func (s *Store) UpsertAsset(ctx context.Context, a Asset) error {
+	if a.Kind != "cover" {
+		return fmt.Errorf("unsupported asset kind %q", a.Kind)
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO track_assets(track_id, kind, path, mime, updated_at)
 		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(track_id, kind) DO UPDATE SET path=excluded.path, mime=excluded.mime, updated_at=excluded.updated_at
@@ -576,10 +431,9 @@ func (s *Store) ListCatalogPage(ctx context.Context, stationUUID, afterTitle, af
 		)
 		SELECT
 			p.id, p.title, p.artist, p.album, p.duration_ms,
-			MAX(CASE WHEN a.kind='cover' THEN 1 ELSE 0 END),
-			MAX(CASE WHEN a.kind='lyrics' THEN 1 ELSE 0 END)
+			MAX(CASE WHEN a.kind='cover' THEN 1 ELSE 0 END)
 		FROM page p
-		LEFT JOIN track_assets a ON a.track_id=p.id AND a.kind IN ('cover', 'lyrics')
+		LEFT JOIN track_assets a ON a.track_id=p.id AND a.kind='cover'
 		GROUP BY p.id, p.title, p.artist, p.album, p.duration_ms
 		ORDER BY p.title COLLATE NOCASE, p.id`,
 		stationUUID, TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
@@ -591,15 +445,12 @@ func (s *Store) ListCatalogPage(ctx context.Context, stationUUID, afterTitle, af
 	var out []CatalogTrack
 	for rows.Next() {
 		var t CatalogTrack
-		var hasCover, hasLyrics int
-		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationMs, &hasCover, &hasLyrics); err != nil {
+		var hasCover int
+		if err := rows.Scan(&t.ID, &t.Title, &t.Artist, &t.Album, &t.DurationMs, &hasCover); err != nil {
 			return nil, err
 		}
 		if hasCover != 0 {
 			t.CoverURL = "/radio/" + stationUUID + "/covers/" + t.ID
-		}
-		if hasLyrics != 0 {
-			t.LyricsURL = "/radio/" + stationUUID + "/lyrics/" + t.ID
 		}
 		out = append(out, t)
 	}
@@ -695,7 +546,7 @@ func (s *Store) listTracks(ctx context.Context, suffix string, args ...any) ([]T
 }
 
 func selectTracksSQL() string {
-	return `SELECT id, station_uuid, content_hash, source_path, source_size, source_mod_unix, cache_path, title, artist, album, comment,
+	return `SELECT id, station_uuid, content_hash, source_path, source_size, source_mod_unix, cache_path, title, artist, album,
 		duration_ms, frame_count, frame_size, bitrate, sample_rate, channels, status, error, created_at, updated_at FROM tracks`
 }
 
@@ -704,7 +555,7 @@ func scanTrack(rows interface {
 }) (Track, error) {
 	var t Track
 	var created, updated string
-	if err := rows.Scan(&t.ID, &t.StationUUID, &t.ContentHash, &t.SourcePath, &t.SourceSize, &t.SourceModUnix, &t.CachePath, &t.Title, &t.Artist, &t.Album, &t.Comment,
+	if err := rows.Scan(&t.ID, &t.StationUUID, &t.ContentHash, &t.SourcePath, &t.SourceSize, &t.SourceModUnix, &t.CachePath, &t.Title, &t.Artist, &t.Album,
 		&t.DurationMs, &t.FrameCount, &t.FrameSize, &t.Bitrate, &t.SampleRate, &t.Channels, &t.Status, &t.Error, &created, &updated); err != nil {
 		return Track{}, err
 	}

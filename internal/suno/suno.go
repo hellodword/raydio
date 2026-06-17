@@ -15,6 +15,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -44,8 +47,9 @@ type Radio struct {
 }
 
 type Syncer struct {
-	client *Client
-	logger *slog.Logger
+	client         *Client
+	logger         *slog.Logger
+	maxConcurrency int
 }
 
 type Result struct {
@@ -110,7 +114,7 @@ func NewSyncer(client *Client, logger *slog.Logger) *Syncer {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Syncer{client: client, logger: logger}
+	return &Syncer{client: client, logger: logger, maxConcurrency: 4}
 }
 
 func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
@@ -131,21 +135,36 @@ func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
 	}
 	nextManifest := Manifest{Files: map[string][]string{}}
 	active := map[string]struct{}{}
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.maxConcurrency)
 	for _, clip := range clips {
+		clip := clip
 		key := clipKey(clip)
 		active[key] = struct{}{}
-		files, downloaded, skipped, err := s.syncClip(ctx, radio.InboxDir, key, clip)
-		result.Downloaded += downloaded
-		result.Skipped += skipped
-		if err != nil {
-			result.Errors++
-			s.logger.Warn("suno clip sync failed", "radio", radio.Alias, "uuid", radio.UUID, "clip", key, "error", err)
-			if oldFiles := oldManifest.Files[key]; len(oldFiles) > 0 {
-				nextManifest.Files[key] = oldFiles
+		g.Go(func() error {
+			files, downloaded, skipped, err := s.syncClip(gctx, radio.InboxDir, key, clip)
+			mu.Lock()
+			defer mu.Unlock()
+			result.Downloaded += downloaded
+			result.Skipped += skipped
+			if err != nil {
+				result.Errors++
+				s.logger.Warn("suno clip sync failed", "radio", radio.Alias, "uuid", radio.UUID, "clip", key, "error", err)
+				if oldFiles := oldManifest.Files[key]; len(oldFiles) > 0 {
+					nextManifest.Files[key] = oldFiles
+				}
+				if gctx.Err() != nil {
+					return gctx.Err()
+				}
+				return nil
 			}
-			continue
-		}
-		nextManifest.Files[key] = files
+			nextManifest.Files[key] = files
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return result, err
 	}
 	deleted, err := deleteStale(radio.InboxDir, oldManifest, active)
 	result.Deleted = deleted
@@ -163,10 +182,7 @@ func (s *Syncer) syncClip(ctx context.Context, dir, key string, clip Clip) ([]st
 	if clip.AudioURL == "" {
 		return nil, 0, 0, errors.New("complete clip has no audio_url")
 	}
-	files := []string{key + ".json"}
-	if err := writeJSONSidecar(filepath.Join(dir, key+".json"), clip, key); err != nil {
-		return files, 0, 0, err
-	}
+	files := []string{}
 	downloaded := 0
 	skipped := 0
 	if clip.ImageURL != "" {
@@ -255,21 +271,6 @@ func safeName(name string) string {
 		return "clip"
 	}
 	return out
-}
-
-func writeJSONSidecar(path string, clip Clip, key string) error {
-	body := map[string]string{
-		"title":   clip.Title,
-		"artist":  clip.Handle,
-		"album":   "",
-		"comment": "Suno clip " + key,
-	}
-	b, err := json.MarshalIndent(body, "", "  ")
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	return writeFileAtomic(path, b, 0o644)
 }
 
 func downloadWithExt(ctx context.Context, client *http.Client, baseURL, rawURL, base string, skipExisting bool) (string, bool, error) {

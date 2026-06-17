@@ -60,12 +60,11 @@ type Now struct {
 }
 
 type NowTrack struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Artist    string `json:"artist"`
-	Album     string `json:"album,omitempty"`
-	CoverURL  string `json:"coverUrl,omitempty"`
-	LyricsURL string `json:"lyricsUrl,omitempty"`
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Artist   string `json:"artist"`
+	Album    string `json:"album,omitempty"`
+	CoverURL string `json:"coverUrl,omitempty"`
 }
 
 func NewScheduler(st *store.Store, stationUUID, silencePath string, gapFrames int64) *Scheduler {
@@ -147,12 +146,11 @@ func (s *Scheduler) Now(ctx context.Context, now time.Time) (Now, error) {
 	}
 	if pos.Track != nil {
 		out.Track = &NowTrack{
-			ID:        pos.Track.ID,
-			Title:     pos.Track.Title,
-			Artist:    pos.Track.Artist,
-			Album:     pos.Track.Album,
-			CoverURL:  pos.AssetURLs["cover"],
-			LyricsURL: pos.AssetURLs["lyrics"],
+			ID:       pos.Track.ID,
+			Title:    pos.Track.Title,
+			Artist:   pos.Track.Artist,
+			Album:    pos.Track.Album,
+			CoverURL: pos.AssetURLs["cover"],
 		}
 	}
 	return out, nil
@@ -313,9 +311,6 @@ func assetURLs(ctx context.Context, st *store.Store, stationUUID, trackID string
 	out := map[string]string{}
 	if _, ok := assets["cover"]; ok {
 		out["cover"] = "/radio/" + stationUUID + "/covers/" + trackID
-	}
-	if _, ok := assets["lyrics"]; ok {
-		out["lyrics"] = "/radio/" + stationUUID + "/lyrics/" + trackID
 	}
 	return out
 }

@@ -7,11 +7,11 @@ position, based on server time.
 
 Raydio runs as three processes:
 
-- `raydio-worker` scans the inbox and performs all ffmpeg/ffprobe/media
-  preprocessing.
+- `raydio-worker` scans the inbox, performs ffmpeg preprocessing, and uses
+  ffprobe for normalized cache MP3 validation.
 - `suno-worker` optionally syncs configured Suno playlists into each station
   inbox.
-- `raydio` serves HTTP, APIs, metadata, and cached MP3 frame ranges.
+- `raydio` serves HTTP, APIs, and cached MP3 frame ranges.
 
 The HTTP server never runs ffmpeg or ffprobe and does not decode audio while
 streaming. Source files are normalized once by the worker into clean
@@ -22,11 +22,11 @@ from disk.
 
 - Per-station live radio timeline shared by listeners of that station.
 - Background schedule maintenance, even when nobody is listening.
-- Separate media worker for scanner, ffmpeg, ffprobe, cache validation, and
-  asset extraction.
+- Separate media worker for scanner, ffmpeg, cache validation, and explicit
+  cover asset copying.
 - Infinite `audio/mpeg` streams at `GET /radio/<uuid-or-alias>`.
 - Browser player at `GET /` with play, pause, volume, current track, cover, and
-  lyric display.
+  status display.
 - SQLite catalog and persistent schedule.
 - Worker-owned ffmpeg preprocessing into clean MP3:
   - 48 kHz
@@ -35,9 +35,9 @@ from disk.
   - no ID3 header
   - no Xing header
   - fixed 576-byte MP3 frames
-- Worker directory scanner for adding and removing tracks.
+- Event-driven worker directory scanner with periodic full-scan fallback.
 - Optional Suno playlist sync worker.
-- Sidecar metadata support for title, artist, album, lyrics, and cover art.
+- Sidecar cover support for `.jpg`, `.jpeg`, `.png`, and `.webp` files.
 - Silence fallback when the catalog is empty.
 
 ## Requirements
@@ -52,6 +52,10 @@ Third-party Go dependencies:
 
 ```text
 github.com/mattn/go-sqlite3 v1.14.44
+github.com/fsnotify/fsnotify v1.10.1
+github.com/pressly/goose/v3 v3.27.1
+golang.org/x/sync v0.21.0
+golang.org/x/time v0.15.0
 go.yaml.in/yaml/v4 v4.0.0-rc.5
 ```
 
@@ -93,10 +97,11 @@ Add MP3 files to:
 ./data/inbox/<radio-uuid>
 ```
 
-`raydio-worker` scans on startup and then rescans every 30 seconds by default.
+`raydio-worker` scans on startup, watches inbox directories for filesystem
+events, and still performs a full rescan every 30 seconds by default.
 `raydio` maintains the future radio schedule every minute by default, even with
-zero listeners. Converted audio, covers, lyrics, the silence file, and the
-SQLite database are stored under `./data`.
+zero listeners. Converted audio, covers, the silence file, and the SQLite
+database are stored under `./data`.
 
 `raydio` expects the worker to have prepared the cache and silence MP3. If the
 cache is missing, the server fails startup with guidance to run `raydio-worker`
@@ -140,6 +145,10 @@ Supported keys:
 | `radios[].alias` | none | Human-readable radio path alias. Lowercase letters, numbers, and hyphens only. |
 | `radios[].uuid` | none | Canonical radio UUID. Worker scans `<worker.inbox_dir>/<uuid>`. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
+| `server.rate_limit_rps` | `10` | Per-client-IP HTTP request rate limit. `/healthz` is exempt. |
+| `server.rate_limit_burst` | `30` | Per-client-IP burst size for HTTP rate limiting. |
+| `server.trusted_proxy_cidrs` | `[]` | Reverse proxy CIDRs or exact IPs whose client-IP headers are trusted. |
+| `server.client_ip_headers` | `["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]` | Header order used only for trusted proxies. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
 | `server.stream_chunk_window` | `480ms` | Shared audio chunk size produced once and fanned out to listeners. |
 | `server.stream_buffer_window` | `2s` | Live catch-up window for slow listeners. |
@@ -167,44 +176,30 @@ events, and worker scan summaries.
 ## Input Files and Metadata
 
 `raydio-worker` processes stable `.mp3` files under each configured
-`<worker.inbox_dir>/<uuid>` directory. Hidden files, `.tmp` files, and `.part`
-files are ignored.
+`<worker.inbox_dir>/<uuid>` directory. It watches the station inbox and
+non-hidden subdirectories with `fsnotify`, debounces changes per station, and
+keeps `worker.rescan_interval` as a full-scan fallback for missed events or
+filesystems without reliable notifications. Hidden paths, `.tmp` files, and
+`.part` files are ignored.
 
-Metadata priority:
+Raydio does not read source MP3 tags, embedded cover art, sidecar JSON metadata,
+or lyric files. Imported track metadata is intentionally simple:
 
-1. Sidecar files next to the MP3.
-2. Embedded tags and embedded cover art.
-3. Fallback values from the filename and `Unknown artist`.
-
-Sidecar JSON example:
-
-```json
-{
-  "title": "Track Title",
-  "artist": "Artist Name",
-  "album": "Album Name",
-  "comment": "Optional note"
-}
-```
+- `title`: source filename without extension.
+- `artist`: `Unknown artist`.
+- `album`: empty.
 
 Supported sidecar files:
 
 ```text
 song.mp3
-song.json
-song.lrc
 song.jpg
 song.jpeg
 song.png
 song.webp
 ```
 
-Lyrics use LRC timestamps, for example:
-
-```text
-[00:12.000]First lyric line
-[00:18.500]Second lyric line
-```
+Only image sidecars are imported, and they are exposed as cover assets.
 
 ### Suno Sync
 
@@ -216,10 +211,10 @@ https://studio-api-prod.suno.com/api/playlist/<uuid>
 ```
 
 Only clips with `clip.status == "complete"` are downloaded. For each clip,
-`suno-worker` writes the MP3, a sidecar JSON file with title and artist, and the
-cover image into `<worker.inbox_dir>/<uuid>`. It keeps a `.suno-manifest.json`
-file and removes only stale files it previously managed; manual inbox files are
-not deleted. `raydio-worker` then imports those files through the normal scanner.
+`suno-worker` writes the MP3 and cover image into `<worker.inbox_dir>/<uuid>`.
+It keeps a `.suno-manifest.json` file for internal bookkeeping and removes only
+stale files it previously managed; manual inbox files are not deleted.
+`raydio-worker` then imports those files through the normal scanner.
 
 ## HTTP Endpoints
 
@@ -232,7 +227,6 @@ not deleted. `raydio-worker` then imports those files through the normal scanner
 | `GET /radio/{uuid-or-alias}/api/events` | Server-Sent Events stream for track changes. |
 | `GET /radio/{uuid-or-alias}/api/catalog` | Paginated current station catalog state. |
 | `GET /radio/{uuid-or-alias}/covers/{trackID}` | Cover asset for a track, when present. |
-| `GET /radio/{uuid-or-alias}/lyrics/{trackID}` | LRC lyric asset for a track, when present. |
 | `GET /healthz` | Plain `ok` health check. |
 
 `/radio/{uuid-or-alias}/api/catalog` is paginated. Use `limit` to request up to
@@ -325,14 +319,12 @@ wall-clock slot and frame.
 
 `raydio-worker` owns every expensive or externally executed media task:
 
-- inbox scan and file stability checks
+- fsnotify inbox watching, full scans, and file stability checks
 - source hashing
-- ffprobe metadata extraction
 - ffmpeg transcode
-- clean MP3 validation
+- clean cache MP3 validation with ffprobe
 - silence MP3 generation
-- embedded cover extraction
-- sidecar lyrics/cover copy
+- sidecar cover copy
 - track and asset DB updates
 - future schedule invalidation after catalog changes
 
@@ -379,12 +371,19 @@ synchronous=NORMAL
 
 Main tables:
 
+- `goose_db_version`
+- `stations`
 - `tracks`
 - `track_assets`
 - `schedule_slots`
-- `stations`
+- `catalog_state`
 - `settings`
-- `schema_migrations`
+
+Schema creation uses embedded goose migrations. Databases created by older
+hand-managed Raydio schemas do not auto-migrate; if an existing SQLite database
+has application tables but no `goose_db_version` table, startup fails with an
+operator-facing error. Remove or recreate the database to start with the current
+fresh schema.
 
 ## Playback From Terminal
 
@@ -396,6 +395,23 @@ curl -sN http://localhost:8080/radio/monthly | ffplay -hide_banner -nodisp -f mp
 
 If `/radio/<uuid-or-alias>` is served behind a reverse proxy, response buffering
 must be disabled for that route.
+
+Rate limiting keys by client IP. By default Raydio ignores `CF-Connecting-IP`,
+`X-Forwarded-For`, and `X-Real-IP` because clients can spoof those headers when
+they can reach the origin directly. To use real client IPs behind Nginx,
+cloudflared, Cloudflare, or another trusted proxy, configure the immediate
+proxy source addresses:
+
+```yaml
+server:
+  trusted_proxy_cidrs: ["127.0.0.1/32", "::1/128"]
+  client_ip_headers: ["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]
+```
+
+For Docker or private reverse proxies, include the proxy subnet, such as
+`172.16.0.0/12`. For Cloudflare direct-to-origin deployments, either configure
+Cloudflare source CIDRs or firewall the origin so only Cloudflare can reach it.
+When the immediate peer is not trusted, Raydio falls back to `RemoteAddr`.
 
 Nginx example:
 
@@ -437,6 +453,10 @@ radios:
     uuid: "00000000-0000-0000-0000-000000000001"
 server:
   addr: "127.0.0.1:18080"
+  rate_limit_rps: 10
+  rate_limit_burst: 30
+  trusted_proxy_cidrs: []
+  client_ip_headers: ["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]
   schedule_interval: 1m
   stream_chunk_window: 480ms
   stream_buffer_window: 2s

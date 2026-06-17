@@ -12,7 +12,6 @@ type Layout struct {
 	CacheDir   string
 	TracksDir  string
 	CoversDir  string
-	LyricsDir  string
 	SilenceDir string
 	DBPath     string
 }
@@ -28,7 +27,6 @@ func New(dataDir, inboxDir string) Layout {
 		CacheDir:   cacheDir,
 		TracksDir:  filepath.Join(cacheDir, "tracks"),
 		CoversDir:  filepath.Join(cacheDir, "covers"),
-		LyricsDir:  filepath.Join(cacheDir, "lyrics"),
 		SilenceDir: filepath.Join(cacheDir, "silence"),
 		DBPath:     filepath.Join(dataDir, "raydio.sqlite"),
 	}
@@ -38,7 +36,6 @@ func CacheDirs(cacheDir string) []string {
 	return []string{
 		filepath.Join(cacheDir, "tracks"),
 		filepath.Join(cacheDir, "covers"),
-		filepath.Join(cacheDir, "lyrics"),
 		filepath.Join(cacheDir, "silence"),
 	}
 }

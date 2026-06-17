@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,35 +16,7 @@ import (
 
 const testStationUUID = "00000000-0000-0000-0000-000000000001"
 
-func TestMergeMetadataSidecarOverridesTags(t *testing.T) {
-	dir := t.TempDir()
-	mp3 := filepath.Join(dir, "song.mp3")
-	sidecar := filepath.Join(dir, "song.json")
-	if err := os.WriteFile(sidecar, []byte(`{"title":"Side Title","artist":"Side Artist","album":"Side Album","comment":"Side Comment"}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	meta := mergeMetadata(mp3, audio.Tags{
-		Title:   "Tag Title",
-		Artist:  "Tag Artist",
-		Album:   "Tag Album",
-		Comment: "Tag Comment",
-	})
-	if meta.Title != "Side Title" || meta.Artist != "Side Artist" || meta.Album != "Side Album" || meta.Comment != "Side Comment" {
-		t.Fatalf("sidecar did not override tags: %+v", meta)
-	}
-}
-
-func TestMergeMetadataFallsBackToTags(t *testing.T) {
-	meta := mergeMetadata(filepath.Join(t.TempDir(), "song.mp3"), audio.Tags{
-		Title:  "Tag Title",
-		Artist: "Tag Artist",
-	})
-	if meta.Title != "Tag Title" || meta.Artist != "Tag Artist" {
-		t.Fatalf("tag fallback failed: %+v", meta)
-	}
-}
-
-func TestScanIsIdempotentAndUsesSidecar(t *testing.T) {
+func TestScanUsesFilenameMetadataAndIgnoresSourceSidecars(t *testing.T) {
 	requireFFmpeg(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -52,16 +25,32 @@ func TestScanIsIdempotentAndUsesSidecar(t *testing.T) {
 	if err := os.MkdirAll(inbox, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	embeddedCover := filepath.Join(dir, "embedded.jpg")
+	if err := exec.CommandContext(ctx, "ffmpeg",
+		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "color=c=red:s=16x16",
+		"-frames:v", "1", embeddedCover,
+	).Run(); err != nil {
+		t.Fatal(err)
+	}
 	src := filepath.Join(inbox, "song.mp3")
 	if err := exec.CommandContext(ctx, "ffmpeg",
 		"-nostdin", "-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "sine=frequency=330:duration=1",
+		"-i", embeddedCover,
+		"-map", "0:a:0", "-map", "1:v:0",
 		"-c:a", "libmp3lame", "-q:a", "4",
+		"-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
+		"-metadata", "title=Tag Title",
+		"-metadata", "artist=Tag Artist",
 		"-f", "mp3", src,
 	).Run(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(inbox, "song.json"), []byte(`{"title":"Side Title","artist":"Side Artist"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inbox, "song.lrc"), []byte("[00:00.000]ignored"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,11 +83,32 @@ func TestScanIsIdempotentAndUsesSidecar(t *testing.T) {
 	if len(tracks) != 1 {
 		t.Fatalf("active tracks = %d, want 1", len(tracks))
 	}
-	if tracks[0].Title != "Side Title" || tracks[0].Artist != "Side Artist" {
-		t.Fatalf("sidecar metadata missing: %+v", tracks[0])
+	if tracks[0].Title != "song" || tracks[0].Artist != "Unknown artist" || tracks[0].Album != "" {
+		t.Fatalf("unexpected imported metadata: %+v", tracks[0])
 	}
 	if _, err := audio.ValidateCleanMP3(ctx, tracks[0].CachePath); err != nil {
 		t.Fatal(err)
+	}
+	assets, err := st.AssetsByTrack(ctx, tracks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assets) != 0 {
+		t.Fatalf("embedded cover or ignored sidecar produced assets: %+v", assets)
+	}
+
+	if err := copyTestFile(embeddedCover, filepath.Join(inbox, "song.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Scan(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assets, err = st.AssetsByTrack(ctx, tracks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assets["cover"].Kind != "cover" || assets["cover"].MIME != "image/jpeg" {
+		t.Fatalf("sidecar cover asset missing: %+v", assets)
 	}
 }
 
@@ -179,6 +189,24 @@ func TestScanRemovesFutureSlotsForMissingTracks(t *testing.T) {
 
 func sqlNullString(v string) sql.NullString {
 	return sql.NullString{String: v, Valid: true}
+}
+
+func copyTestFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func mustUpsertStation(t *testing.T, ctx context.Context, st *store.Store) {

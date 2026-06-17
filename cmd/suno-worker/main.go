@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"raydio/internal/paths"
 	"raydio/internal/settings"
 	"raydio/internal/suno"
@@ -142,30 +144,50 @@ func validateConfig(cfg config) error {
 }
 
 func syncAll(ctx context.Context, syncer *suno.Syncer, radios []radioConfig) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxInt(1, minInt(len(radios), 4)))
 	for _, r := range radios {
-		start := time.Now()
-		slog.Debug("suno sync starting", "radio", r.Alias, "uuid", r.UUID)
-		result, err := syncer.SyncRadio(ctx, suno.Radio{Alias: r.Alias, UUID: r.UUID, InboxDir: r.InboxDir})
-		attrs := []any{
-			"radio", r.Alias,
-			"uuid", r.UUID,
-			"seen", result.Seen,
-			"complete", result.Complete,
-			"downloaded", result.Downloaded,
-			"skipped", result.Skipped,
-			"deleted", result.Deleted,
-			"errors", result.Errors,
-			"duration", time.Since(start),
-		}
-		if err != nil {
-			slog.Error("suno sync failed", append(attrs, "error", err)...)
-			return err
-		}
-		if result.Downloaded > 0 || result.Deleted > 0 || result.Errors > 0 {
-			slog.Info("suno sync finished", attrs...)
-		} else {
-			slog.Debug("suno sync finished", attrs...)
-		}
+		r := r
+		g.Go(func() error {
+			start := time.Now()
+			slog.Debug("suno sync starting", "radio", r.Alias, "uuid", r.UUID)
+			result, err := syncer.SyncRadio(ctx, suno.Radio{Alias: r.Alias, UUID: r.UUID, InboxDir: r.InboxDir})
+			attrs := []any{
+				"radio", r.Alias,
+				"uuid", r.UUID,
+				"seen", result.Seen,
+				"complete", result.Complete,
+				"downloaded", result.Downloaded,
+				"skipped", result.Skipped,
+				"deleted", result.Deleted,
+				"errors", result.Errors,
+				"duration", time.Since(start),
+			}
+			if err != nil {
+				slog.Error("suno sync failed", append(attrs, "error", err)...)
+				return err
+			}
+			if result.Downloaded > 0 || result.Deleted > 0 || result.Errors > 0 {
+				slog.Info("suno sync finished", attrs...)
+			} else {
+				slog.Debug("suno sync finished", attrs...)
+			}
+			return nil
+		})
 	}
-	return nil
+	return g.Wait()
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

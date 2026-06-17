@@ -3,6 +3,7 @@ package settings
 import (
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -29,6 +30,10 @@ type Radio struct {
 
 type Server struct {
 	Addr               string
+	RateLimitRPS       float64
+	RateLimitBurst     int
+	TrustedProxyCIDRs  []string
+	ClientIPHeaders    []string
 	ScheduleInterval   time.Duration
 	StreamChunkWindow  time.Duration
 	StreamBufferWindow time.Duration
@@ -61,11 +66,15 @@ type rawRadio struct {
 }
 
 type rawServer struct {
-	Addr               *string `yaml:"addr"`
-	ScheduleInterval   *string `yaml:"schedule_interval"`
-	StreamChunkWindow  *string `yaml:"stream_chunk_window"`
-	StreamBufferWindow *string `yaml:"stream_buffer_window"`
-	StreamWriteTimeout *string `yaml:"stream_write_timeout"`
+	Addr               *string  `yaml:"addr"`
+	RateLimitRPS       *float64 `yaml:"rate_limit_rps"`
+	RateLimitBurst     *int     `yaml:"rate_limit_burst"`
+	TrustedProxyCIDRs  []string `yaml:"trusted_proxy_cidrs"`
+	ClientIPHeaders    []string `yaml:"client_ip_headers"`
+	ScheduleInterval   *string  `yaml:"schedule_interval"`
+	StreamChunkWindow  *string  `yaml:"stream_chunk_window"`
+	StreamBufferWindow *string  `yaml:"stream_buffer_window"`
+	StreamWriteTimeout *string  `yaml:"stream_write_timeout"`
 }
 
 type rawSuno struct {
@@ -85,6 +94,9 @@ func Defaults() File {
 		LogLevel:  slog.LevelDebug,
 		Server: Server{
 			Addr:               ":8080",
+			RateLimitRPS:       10,
+			RateLimitBurst:     30,
+			ClientIPHeaders:    defaultClientIPHeaders(),
 			ScheduleInterval:   time.Minute,
 			StreamChunkWindow:  480 * time.Millisecond,
 			StreamBufferWindow: 2 * time.Second,
@@ -149,6 +161,18 @@ func parseYAML(b []byte, cfg *File) error {
 	if raw.Server.Addr != nil {
 		cfg.Server.Addr = *raw.Server.Addr
 	}
+	if raw.Server.RateLimitRPS != nil {
+		cfg.Server.RateLimitRPS = *raw.Server.RateLimitRPS
+	}
+	if raw.Server.RateLimitBurst != nil {
+		cfg.Server.RateLimitBurst = *raw.Server.RateLimitBurst
+	}
+	if raw.Server.TrustedProxyCIDRs != nil {
+		cfg.Server.TrustedProxyCIDRs = append([]string(nil), raw.Server.TrustedProxyCIDRs...)
+	}
+	if raw.Server.ClientIPHeaders != nil {
+		cfg.Server.ClientIPHeaders = append([]string(nil), raw.Server.ClientIPHeaders...)
+	}
 	if err := parseOptionalDuration(raw.Server.ScheduleInterval, "server.schedule_interval", &cfg.Server.ScheduleInterval); err != nil {
 		return err
 	}
@@ -179,6 +203,9 @@ func parseYAML(b []byte, cfg *File) error {
 			cfg.Radios = append(cfg.Radios, Radio{Alias: r.Alias, UUID: r.UUID})
 		}
 	}
+	if err := validateServer(cfg); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -198,6 +225,65 @@ var (
 	uuidPattern  = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	aliasPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 )
+
+func defaultClientIPHeaders() []string {
+	return []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"}
+}
+
+func validateServer(cfg *File) error {
+	normalizedHeaders := make([]string, 0, len(cfg.Server.ClientIPHeaders))
+	for _, raw := range cfg.Server.ClientIPHeaders {
+		header, ok := normalizeClientIPHeader(raw)
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("server.client_ip_headers must not contain empty names")
+		}
+		if !ok {
+			return fmt.Errorf("server.client_ip_headers contains unsupported header %q", raw)
+		}
+		normalizedHeaders = append(normalizedHeaders, header)
+	}
+	cfg.Server.ClientIPHeaders = normalizedHeaders
+
+	normalizedCIDRs := make([]string, 0, len(cfg.Server.TrustedProxyCIDRs))
+	for _, raw := range cfg.Server.TrustedProxyCIDRs {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			return fmt.Errorf("server.trusted_proxy_cidrs must not contain empty values")
+		}
+		prefix, err := parseTrustedProxyPrefix(value)
+		if err != nil {
+			return fmt.Errorf("server.trusted_proxy_cidrs contains invalid value %q", raw)
+		}
+		normalizedCIDRs = append(normalizedCIDRs, prefix.String())
+	}
+	cfg.Server.TrustedProxyCIDRs = normalizedCIDRs
+	return nil
+}
+
+func normalizeClientIPHeader(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "cf-connecting-ip":
+		return "CF-Connecting-IP", true
+	case "x-forwarded-for":
+		return "X-Forwarded-For", true
+	case "x-real-ip":
+		return "X-Real-IP", true
+	default:
+		return "", false
+	}
+}
+
+func parseTrustedProxyPrefix(value string) (netip.Prefix, error) {
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix.Masked(), nil
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
 
 func validateRadios(cfg *File) error {
 	if len(cfg.Radios) == 0 {

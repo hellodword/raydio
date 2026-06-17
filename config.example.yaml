@@ -79,6 +79,22 @@ server:
   # HTTP listen address for raydio.
   addr: "127.0.0.1:8080"
 
+  # Per-client-IP HTTP request limit. /healthz is exempt.
+  rate_limit_rps: 10
+
+  # Per-client-IP burst size for HTTP request limiting.
+  rate_limit_burst: 30
+
+  # CIDRs or exact IPs for reverse proxies whose client-IP headers are trusted.
+  # Keep empty unless raydio is only reachable through those proxies.
+  # Examples for local Nginx/cloudflared:
+  # trusted_proxy_cidrs: ["127.0.0.1/32", "::1/128"]
+  trusted_proxy_cidrs: []
+
+  # Header order used only when the immediate peer matches trusted_proxy_cidrs.
+  # Supported values: CF-Connecting-IP, X-Forwarded-For, X-Real-IP.
+  client_ip_headers: ["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]
+
   # Background schedule maintenance interval.
   # This uses Go duration syntax, such as 500ms, 15s, 1m, or 1h.
   schedule_interval: 1m
@@ -106,6 +122,7 @@ worker:
   # Leave empty to use <data_dir>/inbox.
   inbox_dir: ""
 
-  # How often raydio-worker rescans the inbox directory.
+  # How often raydio-worker performs a full inbox rescan in addition to
+  # fsnotify event-driven scans.
   # This uses Go duration syntax, such as 500ms, 15s, 1m, or 1h.
   rescan_interval: 30s

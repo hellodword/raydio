@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -162,6 +163,75 @@ func TestWorkerScansMP3IntoCache(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("worker did not stop after context cancellation")
+	}
+}
+
+func TestWatchAndScanDebouncesEventsAndWatchesNewDirectories(t *testing.T) {
+	oldDebounce := watchDebounce
+	watchDebounce = 25 * time.Millisecond
+	defer func() { watchDebounce = oldDebounce }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	inbox := filepath.Join(dir, testStationUUID)
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var scans atomic.Int64
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- watchAndScan(ctx, time.Hour, []catalogRuntime{{
+			alias: "monthly",
+			uuid:  testStationUUID,
+			inbox: inbox,
+		}}, func(context.Context, catalogRuntime) error {
+			scans.Add(1)
+			return nil
+		})
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	subdir := filepath.Join(inbox, "nested")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return scans.Load() >= 1
+	})
+
+	before := scans.Load()
+	if err := os.WriteFile(filepath.Join(subdir, "song.mp3"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, time.Second, func() bool {
+		return scans.Load() > before
+	})
+
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watch loop did not stop")
+	}
+}
+
+func TestIgnoredPathFiltersHiddenTempAndPartialFiles(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "inbox")
+	if ignoredPath(root, filepath.Join(root, "song.mp3")) {
+		t.Fatal("regular mp3 should not be ignored")
+	}
+	for _, path := range []string{
+		filepath.Join(root, ".hidden", "song.mp3"),
+		filepath.Join(root, "song.tmp"),
+		filepath.Join(root, "song.part"),
+	} {
+		if !ignoredPath(root, path) {
+			t.Fatalf("%s should be ignored", path)
+		}
 	}
 }
 

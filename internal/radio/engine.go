@@ -413,12 +413,11 @@ func (e *Engine) updateNow(ctx context.Context, now time.Time) error {
 	}
 	if pos.track != nil {
 		out.Track = &NowTrack{
-			ID:        pos.track.ID,
-			Title:     pos.track.Title,
-			Artist:    pos.track.Artist,
-			Album:     pos.track.Album,
-			CoverURL:  pos.assetURLs["cover"],
-			LyricsURL: pos.assetURLs["lyrics"],
+			ID:       pos.track.ID,
+			Title:    pos.track.Title,
+			Artist:   pos.track.Artist,
+			Album:    pos.track.Album,
+			CoverURL: pos.assetURLs["cover"],
 		}
 	}
 	e.now.Store(out)
@@ -521,8 +520,6 @@ func assetURLsByTrack(stationUUID string, assets map[string]map[string]store.Ass
 			switch a.Kind {
 			case "cover":
 				out[trackID]["cover"] = "/radio/" + stationUUID + "/covers/" + trackID
-			case "lyrics":
-				out[trackID]["lyrics"] = "/radio/" + stationUUID + "/lyrics/" + trackID
 			}
 		}
 	}

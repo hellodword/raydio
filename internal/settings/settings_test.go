@@ -19,6 +19,14 @@ log_level: WARN
 
 server:
   addr: ":18080"
+  rate_limit_rps: 7.5
+  rate_limit_burst: 11
+  trusted_proxy_cidrs:
+    - 127.0.0.1
+    - 10.0.0.0/8
+  client_ip_headers:
+    - x-forwarded-for
+    - cf-connecting-ip
   schedule_interval: 250ms
   stream_chunk_window: 240ms
   stream_buffer_window: 2s
@@ -54,6 +62,18 @@ radios:
 	}
 	if cfg.Server.Addr != ":18080" {
 		t.Fatalf("Server.Addr = %q", cfg.Server.Addr)
+	}
+	if cfg.Server.RateLimitRPS != 7.5 {
+		t.Fatalf("Server.RateLimitRPS = %v", cfg.Server.RateLimitRPS)
+	}
+	if cfg.Server.RateLimitBurst != 11 {
+		t.Fatalf("Server.RateLimitBurst = %d", cfg.Server.RateLimitBurst)
+	}
+	if strings.Join(cfg.Server.TrustedProxyCIDRs, ",") != "127.0.0.1/32,10.0.0.0/8" {
+		t.Fatalf("Server.TrustedProxyCIDRs = %+v", cfg.Server.TrustedProxyCIDRs)
+	}
+	if strings.Join(cfg.Server.ClientIPHeaders, ",") != "X-Forwarded-For,CF-Connecting-IP" {
+		t.Fatalf("Server.ClientIPHeaders = %+v", cfg.Server.ClientIPHeaders)
 	}
 	if cfg.Server.ScheduleInterval != 250*time.Millisecond {
 		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
@@ -109,6 +129,18 @@ radios:
 	}
 	if cfg.Server.ScheduleInterval != time.Minute {
 		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
+	}
+	if cfg.Server.RateLimitRPS != 10 {
+		t.Fatalf("Server.RateLimitRPS = %v", cfg.Server.RateLimitRPS)
+	}
+	if cfg.Server.RateLimitBurst != 30 {
+		t.Fatalf("Server.RateLimitBurst = %d", cfg.Server.RateLimitBurst)
+	}
+	if len(cfg.Server.TrustedProxyCIDRs) != 0 {
+		t.Fatalf("Server.TrustedProxyCIDRs = %+v", cfg.Server.TrustedProxyCIDRs)
+	}
+	if strings.Join(cfg.Server.ClientIPHeaders, ",") != "CF-Connecting-IP,X-Forwarded-For,X-Real-IP" {
+		t.Fatalf("Server.ClientIPHeaders = %+v", cfg.Server.ClientIPHeaders)
 	}
 	if cfg.Server.StreamChunkWindow != 480*time.Millisecond {
 		t.Fatalf("Server.StreamChunkWindow = %s", cfg.Server.StreamChunkWindow)
@@ -234,6 +266,38 @@ radios:
 	}
 	if !strings.Contains(err.Error(), "server.schedule_interval must be a Go duration") {
 		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestLoadRejectsInvalidClientIPSettings(t *testing.T) {
+	tests := []string{
+		`server:
+  trusted_proxy_cidrs: ["not-a-cidr"]
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`,
+		`server:
+  client_ip_headers: ["Forwarded"]
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`,
+		`server:
+  trusted_proxy_cidrs: [""]
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`,
+	}
+	for _, body := range tests {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("expected invalid client IP settings to fail: %s", body)
+		}
 	}
 }
 

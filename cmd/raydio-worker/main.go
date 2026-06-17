@@ -9,8 +9,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"golang.org/x/sync/errgroup"
 
 	"raydio/internal/catalog"
 	"raydio/internal/paths"
@@ -127,6 +131,7 @@ func run(ctx context.Context, cfg config) error {
 		cats = append(cats, catalogRuntime{
 			alias: r.Alias,
 			uuid:  r.UUID,
+			inbox: r.InboxDir,
 			cat: catalog.New(catalog.Config{
 				StationUUID:   r.UUID,
 				InboxDir:      r.InboxDir,
@@ -138,7 +143,7 @@ func run(ctx context.Context, cfg config) error {
 	if err := scanAll(ctx, cats); err != nil {
 		return err
 	}
-	return scanLoop(ctx, cfg.RescanInterval, cats)
+	return watchAndScan(ctx, cfg.RescanInterval, cats, scan)
 }
 
 func validateConfig(cfg config) error {
@@ -157,16 +162,81 @@ func validateConfig(cfg config) error {
 type catalogRuntime struct {
 	alias string
 	uuid  string
+	inbox string
 	cat   *catalog.Service
 }
 
-func scanLoop(ctx context.Context, interval time.Duration, cats []catalogRuntime) error {
+type scannerFunc func(context.Context, catalogRuntime) error
+
+var watchDebounce = 500 * time.Millisecond
+
+func watchAndScan(ctx context.Context, interval time.Duration, cats []catalogRuntime, scanFn scannerFunc) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	watched := map[string]struct{}{}
+	for _, cat := range cats {
+		if err := watchTree(watcher, watched, cat.inbox); err != nil {
+			return err
+		}
+	}
+
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	scanReq := make(chan string, maxInt(4, len(cats)*4))
+	timers := map[string]*time.Timer{}
+	catsByUUID := map[string]catalogRuntime{}
+	for _, cat := range cats {
+		catsByUUID[cat.uuid] = cat
+	}
+	schedule := func(uuid string) {
+		if timer := timers[uuid]; timer != nil {
+			timer.Reset(watchDebounce)
+			return
+		}
+		timers[uuid] = time.AfterFunc(watchDebounce, func() {
+			select {
+			case scanReq <- uuid:
+			default:
+			}
+		})
+	}
+	defer func() {
+		for _, timer := range timers {
+			timer.Stop()
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			cat, ok := stationForPath(cats, event.Name)
+			if !ok || ignoredPath(cat.inbox, event.Name) {
+				continue
+			}
+			if event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					if err := watchTree(watcher, watched, event.Name); err != nil {
+						slog.Warn("watch new directory failed", "path", event.Name, "error", err)
+					}
+				}
+			}
+			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Remove) {
+				schedule(cat.uuid)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			slog.Warn("catalog watcher error", "error", err)
 		case <-ticker.C:
 			slog.Debug("catalog scan tick")
 			if err := scanAll(ctx, cats); err != nil {
@@ -175,17 +245,89 @@ func scanLoop(ctx context.Context, interval time.Duration, cats []catalogRuntime
 				}
 				slog.Error("catalog scan failed", "error", err)
 			}
+		case uuid := <-scanReq:
+			cat, ok := catsByUUID[uuid]
+			if !ok {
+				continue
+			}
+			if err := scanFn(ctx, cat); err != nil {
+				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+					return nil
+				}
+				slog.Error("catalog scan failed", "radio", cat.alias, "uuid", cat.uuid, "error", err)
+			}
 		}
 	}
 }
 
 func scanAll(ctx context.Context, cats []catalogRuntime) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(maxInt(1, minInt(len(cats), 4)))
 	for _, cat := range cats {
-		if err := scan(ctx, cat); err != nil {
+		cat := cat
+		g.Go(func() error {
+			return scan(ctx, cat)
+		})
+	}
+	return g.Wait()
+}
+
+func watchTree(watcher *fsnotify.Watcher, watched map[string]struct{}, root string) error {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		if path != root && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		clean := filepath.Clean(path)
+		if _, ok := watched[clean]; ok {
+			return nil
+		}
+		if err := watcher.Add(clean); err != nil {
 			return err
 		}
+		watched[clean] = struct{}{}
+		return nil
+	})
+}
+
+func stationForPath(cats []catalogRuntime, path string) (catalogRuntime, bool) {
+	clean := filepath.Clean(path)
+	for _, cat := range cats {
+		root := filepath.Clean(cat.inbox)
+		if clean == root {
+			return cat, true
+		}
+		rel, err := filepath.Rel(root, clean)
+		if err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+			return cat, true
+		}
 	}
-	return nil
+	return catalogRuntime{}, false
+}
+
+func ignoredPath(root, path string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return true
+	}
+	if rel == "." {
+		return false
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	lower := strings.ToLower(filepath.Base(path))
+	return strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".part")
 }
 
 func scan(ctx context.Context, cat catalogRuntime) error {
@@ -211,4 +353,18 @@ func scan(ctx context.Context, cat catalogRuntime) error {
 		slog.Debug("catalog scan finished", attrs...)
 	}
 	return nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

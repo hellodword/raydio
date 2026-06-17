@@ -80,15 +80,6 @@ p {
   font-size: 20px;
 }
 
-.lyric {
-  margin-top: 24px;
-  min-height: 34px;
-  color: #f0c36a;
-  font-size: 22px;
-  line-height: 1.35;
-  overflow-wrap: anywhere;
-}
-
 .controls {
   grid-column: 1 / -1;
   display: flex;

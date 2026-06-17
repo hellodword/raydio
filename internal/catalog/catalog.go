@@ -5,18 +5,20 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"mime"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"raydio/internal/audio"
 	"raydio/internal/paths"
 	"raydio/internal/store"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type Config struct {
@@ -25,6 +27,7 @@ type Config struct {
 	CacheDir      string
 	SilenceFrames int64
 	StableDelay   time.Duration
+	ImportLimit   int
 }
 
 type Service struct {
@@ -40,11 +43,9 @@ type ScanResult struct {
 	Changed   bool `json:"changed"`
 }
 
-type Metadata struct {
-	Title   string `json:"title"`
-	Artist  string `json:"artist"`
-	Album   string `json:"album"`
-	Comment string `json:"comment"`
+type scanCandidate struct {
+	path string
+	info os.FileInfo
 }
 
 func New(cfg Config, st *store.Store) *Service {
@@ -53,6 +54,9 @@ func New(cfg Config, st *store.Store) *Service {
 	}
 	if cfg.SilenceFrames == 0 {
 		cfg.SilenceFrames = 209
+	}
+	if cfg.ImportLimit <= 0 {
+		cfg.ImportLimit = 2
 	}
 	return &Service{cfg: cfg, store: st}
 }
@@ -78,6 +82,7 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 
 	var result ScanResult
 	seen := map[string]struct{}{}
+	var candidates []scanCandidate
 	err := filepath.WalkDir(s.cfg.InboxDir, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			result.Errors++
@@ -100,19 +105,37 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 			return nil
 		}
 		seen[path] = struct{}{}
-		changed, err := s.processFile(ctx, path, info)
-		if err != nil {
-			result.Errors++
-			_ = s.markFileError(ctx, path, err)
-			return nil
-		}
-		if changed {
-			result.Changed = true
-		}
-		result.Processed++
+		candidates = append(candidates, scanCandidate{path: path, info: info})
 		return nil
 	})
 	if err != nil {
+		return result, err
+	}
+	var mu sync.Mutex
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(s.cfg.ImportLimit)
+	for _, candidate := range candidates {
+		candidate := candidate
+		g.Go(func() error {
+			if err := gctx.Err(); err != nil {
+				return err
+			}
+			changed, err := s.processFile(gctx, candidate.path, candidate.info)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				result.Errors++
+				_ = s.markFileError(context.Background(), candidate.path, err)
+				return nil
+			}
+			if changed {
+				result.Changed = true
+			}
+			result.Processed++
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
 		return result, err
 	}
 	missing, err := s.store.MarkMissingExcept(ctx, s.cfg.StationUUID, seen)
@@ -157,17 +180,6 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 	if err != nil {
 		return false, err
 	}
-	probe, err := audio.FFprobe(ctx, path)
-	if err != nil {
-		return false, err
-	}
-	meta := mergeMetadata(path, audio.TagsFromProbe(probe))
-	if meta.Title == "" {
-		meta.Title = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	}
-	if meta.Artist == "" {
-		meta.Artist = "Unknown artist"
-	}
 
 	t := store.Track{
 		ID:            id,
@@ -177,10 +189,9 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 		SourceSize:    info.Size(),
 		SourceModUnix: info.ModTime().Unix(),
 		CachePath:     cachePath,
-		Title:         meta.Title,
-		Artist:        meta.Artist,
-		Album:         meta.Album,
-		Comment:       meta.Comment,
+		Title:         strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		Artist:        "Unknown artist",
+		Album:         "",
 		DurationMs:    v.DurationMs,
 		FrameCount:    v.FrameCount,
 		FrameSize:     v.FrameSize,
@@ -200,7 +211,7 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 	if err := s.store.UpsertTrack(ctx, t); err != nil {
 		return false, err
 	}
-	if err := s.syncAssets(ctx, id, path, probe); err != nil {
+	if err := s.syncAssets(ctx, id, path); err != nil {
 		return false, err
 	}
 	return changed, nil
@@ -216,7 +227,6 @@ func trackChanged(old, next store.Track) bool {
 		old.Title != next.Title ||
 		old.Artist != next.Artist ||
 		old.Album != next.Album ||
-		old.Comment != next.Comment ||
 		old.DurationMs != next.DurationMs ||
 		old.FrameCount != next.FrameCount ||
 		old.FrameSize != next.FrameSize ||
@@ -241,19 +251,7 @@ func stationTrackID(stationUUID, contentHash string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Service) syncAssets(ctx context.Context, trackID, sourcePath string, probe audio.Probe) error {
-	if lrc := firstExisting(replaceExt(sourcePath, ".lrc")); lrc != "" {
-		dst := filepath.Join(s.cfg.CacheDir, "lyrics", trackID+".lrc")
-		if err := copyFile(lrc, dst); err != nil {
-			return err
-		}
-		if err := s.store.UpsertAsset(ctx, store.Asset{TrackID: trackID, Kind: "lyrics", Path: dst, MIME: "text/plain; charset=utf-8"}); err != nil {
-			return err
-		}
-	} else if err := s.store.DeleteAsset(ctx, trackID, "lyrics"); err != nil {
-		return err
-	}
-
+func (s *Service) syncAssets(ctx context.Context, trackID, sourcePath string) error {
 	cover := firstExisting(
 		replaceExt(sourcePath, ".jpg"),
 		replaceExt(sourcePath, ".jpeg"),
@@ -271,43 +269,7 @@ func (s *Service) syncAssets(ctx context.Context, trackID, sourcePath string, pr
 		}
 		return nil
 	}
-
-	if audio.HasAttachedPicture(probe) {
-		dst := filepath.Join(s.cfg.CacheDir, "covers", trackID+".jpg")
-		if err := audio.ExtractEmbeddedCover(ctx, sourcePath, dst); err == nil {
-			return s.store.UpsertAsset(ctx, store.Asset{TrackID: trackID, Kind: "cover", Path: dst, MIME: "image/jpeg"})
-		}
-	}
 	return s.store.DeleteAsset(ctx, trackID, "cover")
-}
-
-func mergeMetadata(path string, tags audio.Tags) Metadata {
-	meta := Metadata{
-		Title:   tags.Title,
-		Artist:  tags.Artist,
-		Album:   tags.Album,
-		Comment: tags.Comment,
-	}
-	sidecar := replaceExt(path, ".json")
-	b, err := os.ReadFile(sidecar)
-	if err == nil {
-		var sc Metadata
-		if json.Unmarshal(b, &sc) == nil {
-			if strings.TrimSpace(sc.Title) != "" {
-				meta.Title = strings.TrimSpace(sc.Title)
-			}
-			if strings.TrimSpace(sc.Artist) != "" {
-				meta.Artist = strings.TrimSpace(sc.Artist)
-			}
-			if strings.TrimSpace(sc.Album) != "" {
-				meta.Album = strings.TrimSpace(sc.Album)
-			}
-			if strings.TrimSpace(sc.Comment) != "" {
-				meta.Comment = strings.TrimSpace(sc.Comment)
-			}
-		}
-	}
-	return meta
 }
 
 func isCandidate(path, name string) bool {

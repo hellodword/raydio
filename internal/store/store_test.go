@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -323,6 +324,53 @@ func TestMigrationCreatesPerformanceIndexes(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("trigger %s count = %d, want 1", name, count)
 		}
+	}
+}
+
+func TestGooseMigrationCreatesFreshSchemaAndRejectsLegacyDatabase(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "raydio.sqlite")
+	st, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		"goose_db_version",
+		"stations",
+		"tracks",
+		"track_assets",
+		"schedule_slots",
+		"catalog_state",
+		"settings",
+	} {
+		var count int
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("table %s count = %d, want 1", name, count)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	legacyPath := filepath.Join(dir, "legacy.sqlite")
+	db, err := sql.Open("sqlite3", sqliteDSN(legacyPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, legacyPath); err == nil {
+		t.Fatal("expected legacy non-goose database to fail")
+	} else if err.Error() != "database has a legacy non-goose schema; remove or recreate the SQLite database before starting this version" {
+		t.Fatalf("legacy error = %q", err)
 	}
 }
 

@@ -6,16 +6,10 @@ const volume = document.getElementById("volume");
 const title = document.getElementById("title");
 const artist = document.getElementById("artist");
 const statusText = document.getElementById("status");
-const lyricText = document.getElementById("lyric");
 const cover = document.getElementById("cover");
 const coverFallback = document.getElementById("coverFallback");
 
 let currentNow = null;
-let lyrics = [];
-let lyricIndex = -1;
-let lyricsTrackID = "";
-let lyricsRequestID = 0;
-let serverOffsetMs = 0;
 let stations = [];
 let currentStation = null;
 let events = null;
@@ -99,13 +93,8 @@ async function loadNow() {
 
 function resetTrackState() {
   currentNow = null;
-  lyrics = [];
-  lyricIndex = -1;
-  lyricsTrackID = "";
-  lyricsRequestID++;
   title.textContent = "No track";
   artist.textContent = "Unknown artist";
-  lyricText.textContent = "";
   cover.removeAttribute("src");
   cover.style.display = "none";
   coverFallback.style.display = "grid";
@@ -113,19 +102,13 @@ function resetTrackState() {
 
 function renderNow(now) {
   currentNow = now;
-  serverOffsetMs = now.serverTimeMs - Date.now();
 
   if (now.isSilence || !now.track) {
     title.textContent = "Silence";
     artist.textContent = "No active track";
-    lyricText.textContent = "";
     cover.style.display = "none";
     coverFallback.style.display = "grid";
     statusText.textContent = audio.paused ? "ready" : "playing";
-    lyrics = [];
-    lyricIndex = -1;
-    lyricsTrackID = "";
-    lyricsRequestID++;
     return;
   }
 
@@ -142,63 +125,6 @@ function renderNow(now) {
     cover.style.display = "none";
     coverFallback.style.display = "grid";
   }
-
-  if (now.track.lyricsUrl) {
-    if (lyricsTrackID === now.track.id) {
-      updateLyric();
-      return;
-    }
-    const requestID = ++lyricsRequestID;
-    const trackID = now.track.id;
-    fetch(now.track.lyricsUrl, { cache: "no-store" })
-      .then((res) => (res.ok ? res.text() : ""))
-      .then((text) => {
-        if (requestID !== lyricsRequestID) return;
-        lyrics = parseLRC(text);
-        lyricIndex = -1;
-        lyricsTrackID = trackID;
-        updateLyric();
-      })
-      .catch(() => {
-        if (requestID !== lyricsRequestID) return;
-        lyrics = [];
-        lyricIndex = -1;
-        lyricsTrackID = "";
-        lyricText.textContent = "";
-      });
-  } else {
-    lyricsRequestID++;
-    lyrics = [];
-    lyricIndex = -1;
-    lyricsTrackID = "";
-    lyricText.textContent = "";
-  }
-}
-
-function parseLRC(text) {
-  const out = [];
-  for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\](.*)$/);
-    if (!match) continue;
-    const min = Number(match[1]);
-    const sec = Number(match[2]);
-    const frac = Number((match[3] || "0").padEnd(3, "0"));
-    out.push({ at: min * 60000 + sec * 1000 + frac, text: match[4].trim() });
-  }
-  return out.sort((a, b) => a.at - b.at);
-}
-
-function updateLyric() {
-  if (!currentNow || lyrics.length === 0) return;
-  const serverNow = Date.now() + serverOffsetMs;
-  const elapsed = serverNow - currentNow.startedAtMs;
-  while (lyricIndex + 1 < lyrics.length && lyrics[lyricIndex + 1].at <= elapsed) {
-    lyricIndex++;
-  }
-  while (lyricIndex >= 0 && lyrics[lyricIndex].at > elapsed) {
-    lyricIndex--;
-  }
-  lyricText.textContent = lyricIndex >= 0 ? lyrics[lyricIndex].text : "";
 }
 
 function connectEvents() {
@@ -212,7 +138,6 @@ function connectEvents() {
   });
 }
 
-setInterval(updateLyric, 500);
 loadStations().catch(() => {
   statusText.textContent = "offline";
 });

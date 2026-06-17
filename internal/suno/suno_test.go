@@ -81,18 +81,14 @@ func TestSyncRadioDownloadsClipAssetsAndManifest(t *testing.T) {
 	}
 	assertFile(t, filepath.Join(dir, "clip-a.mp3"), "mp3")
 	assertFile(t, filepath.Join(dir, "clip-a.png"), "png")
-	sidecar, err := os.ReadFile(filepath.Join(dir, "clip-a.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(sidecar), `"title": "Song A"`) || !strings.Contains(string(sidecar), `"artist": "Artist A"`) {
-		t.Fatalf("sidecar = %s", sidecar)
+	if _, err := os.Stat(filepath.Join(dir, "clip-a.json")); !os.IsNotExist(err) {
+		t.Fatalf("metadata sidecar exists err=%v", err)
 	}
 	manifest, err := os.ReadFile(filepath.Join(dir, manifestFile))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(manifest), "clip-a.mp3") || !strings.Contains(string(manifest), "clip-a.png") {
+	if !strings.Contains(string(manifest), "clip-a.mp3") || !strings.Contains(string(manifest), "clip-a.png") || strings.Contains(string(manifest), "clip-a.json") {
 		t.Fatalf("manifest = %s", manifest)
 	}
 }

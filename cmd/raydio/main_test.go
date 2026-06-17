@@ -24,6 +24,8 @@ const testStationUUID = "00000000-0000-0000-0000-000000000001"
 
 func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	cfg := config{
+		RateLimitRPS:       10,
+		RateLimitBurst:     30,
 		ScheduleInterval:   0,
 		StreamChunkWindow:  time.Millisecond,
 		StreamBufferWindow: time.Second,
@@ -35,6 +37,37 @@ func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsInvalidRateLimit(t *testing.T) {
+	cfg := config{
+		RateLimitRPS:       0,
+		RateLimitBurst:     30,
+		ScheduleInterval:   time.Second,
+		StreamChunkWindow:  minStreamChunkWindow,
+		StreamBufferWindow: time.Second,
+		StreamWriteTimeout: time.Second,
+		GapFrames:          1,
+		Radios:             []radioConfig{{Alias: "monthly", UUID: testStationUUID}},
+	}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("expected non-positive rate limit rps to fail validation")
+	}
+	cfg.RateLimitRPS = 10
+	cfg.RateLimitBurst = 0
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("expected non-positive rate limit burst to fail validation")
+	}
+	cfg.RateLimitBurst = 30
+	cfg.TrustedProxyCIDRs = []string{"not-a-cidr"}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("expected invalid trusted proxy cidr to fail validation")
+	}
+	cfg.TrustedProxyCIDRs = nil
+	cfg.ClientIPHeaders = []string{"Forwarded"}
+	if err := validateConfig(cfg); err == nil {
+		t.Fatal("expected unsupported client ip header to fail validation")
+	}
+}
+
 func TestReadConfigLoadsServerSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -43,6 +76,14 @@ gap_frames: 7
 log_level: ERROR
 server:
   addr: ":18080"
+  rate_limit_rps: 5.5
+  rate_limit_burst: 12
+  trusted_proxy_cidrs:
+    - 127.0.0.1
+    - 10.0.0.0/8
+  client_ip_headers:
+    - x-forwarded-for
+    - cf-connecting-ip
   schedule_interval: 250ms
   stream_chunk_window: 240ms
   stream_buffer_window: 2s
@@ -75,6 +116,18 @@ radios:
 	if cfg.ScheduleInterval != 250*time.Millisecond {
 		t.Fatalf("ScheduleInterval = %s", cfg.ScheduleInterval)
 	}
+	if cfg.RateLimitRPS != 5.5 {
+		t.Fatalf("RateLimitRPS = %v", cfg.RateLimitRPS)
+	}
+	if cfg.RateLimitBurst != 12 {
+		t.Fatalf("RateLimitBurst = %d", cfg.RateLimitBurst)
+	}
+	if strings.Join(cfg.TrustedProxyCIDRs, ",") != "127.0.0.1/32,10.0.0.0/8" {
+		t.Fatalf("TrustedProxyCIDRs = %+v", cfg.TrustedProxyCIDRs)
+	}
+	if strings.Join(cfg.ClientIPHeaders, ",") != "X-Forwarded-For,CF-Connecting-IP" {
+		t.Fatalf("ClientIPHeaders = %+v", cfg.ClientIPHeaders)
+	}
 	if cfg.StreamChunkWindow != 240*time.Millisecond {
 		t.Fatalf("StreamChunkWindow = %s", cfg.StreamChunkWindow)
 	}
@@ -104,6 +157,8 @@ func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
 		DataDir:            dir,
 		CacheDir:           layout.CacheDir,
 		DBPath:             layout.DBPath,
+		RateLimitRPS:       10,
+		RateLimitBurst:     30,
 		ScheduleInterval:   time.Second,
 		StreamChunkWindow:  minStreamChunkWindow,
 		StreamBufferWindow: time.Second,
@@ -142,6 +197,8 @@ func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
 			DataDir:            dir,
 			CacheDir:           layout.CacheDir,
 			DBPath:             layout.DBPath,
+			RateLimitRPS:       10,
+			RateLimitBurst:     30,
 			ScheduleInterval:   5 * time.Millisecond,
 			StreamChunkWindow:  minStreamChunkWindow,
 			StreamBufferWindow: time.Second,
@@ -235,6 +292,9 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 	if strings.Contains(rr.Body.String(), "cachePath") || strings.Contains(rr.Body.String(), "sourcePath") {
 		t.Fatalf("catalog exposed internal paths: %s", rr.Body.String())
 	}
+	if strings.Contains(rr.Body.String(), "lyrics") {
+		t.Fatalf("catalog exposed lyrics field: %s", rr.Body.String())
+	}
 	var page struct {
 		Revision   int64                `json:"revision"`
 		Tracks     []store.CatalogTrack `json:"tracks"`
@@ -284,13 +344,155 @@ func TestRoutesRejectLegacyRadioAndAPIPaths(t *testing.T) {
 	a := testApp(nil)
 	mux := http.NewServeMux()
 	a.routes(mux)
-	for _, path := range []string{"/radio", "/api/now", "/api/events", "/api/catalog"} {
+	for _, path := range []string{"/radio", "/api/now", "/api/events", "/api/catalog", "/radio/monthly/lyrics/aaa"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rr := httptest.NewRecorder()
 		mux.ServeHTTP(rr, req)
 		if rr.Code != http.StatusNotFound {
 			t.Fatalf("%s status = %d, want 404", path, rr.Code)
 		}
+	}
+}
+
+func TestRateLimitMiddlewareLimitsAPIAndExemptsHealthz(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/stations", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	handler := newRateLimitMiddleware(1, 1, mustClientIPResolver(t, nil, nil), mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first status = %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+	req.RemoteAddr = "192.0.2.10:1234"
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d", rr.Code)
+	}
+
+	for i := 0; i < 3; i++ {
+		req = httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		req.RemoteAddr = "192.0.2.10:1234"
+		rr = httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("healthz status = %d", rr.Code)
+		}
+	}
+}
+
+func TestRateLimitMiddlewareSeparatesClientsBehindTrustedProxy(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/stations", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+	handler := newRateLimitMiddleware(1, 1, mustClientIPResolver(t, []string{"10.0.0.0/8"}, nil), mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+	req.RemoteAddr = "10.1.2.3:1234"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.10")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("first client status = %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+	req.RemoteAddr = "10.1.2.3:1234"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.11")
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("second client status = %d", rr.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+	req.RemoteAddr = "10.1.2.3:1234"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.10")
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusTooManyRequests {
+		t.Fatalf("first client repeat status = %d", rr.Code)
+	}
+}
+
+func TestClientIPResolver(t *testing.T) {
+	tests := []struct {
+		name     string
+		trusted  []string
+		headers  []string
+		remote   string
+		reqHeads map[string]string
+		want     string
+	}{
+		{
+			name:   "direct remote ignores spoofed headers",
+			remote: "192.0.2.10:1234",
+			reqHeads: map[string]string{
+				"CF-Connecting-IP": "198.51.100.10",
+			},
+			want: "192.0.2.10",
+		},
+		{
+			name:    "trusted proxy uses cloudflare header",
+			trusted: []string{"10.0.0.0/8"},
+			remote:  "10.1.2.3:1234",
+			reqHeads: map[string]string{
+				"CF-Connecting-IP": "198.51.100.10",
+			},
+			want: "198.51.100.10",
+		},
+		{
+			name:    "trusted proxy uses first valid forwarded for",
+			trusted: []string{"10.0.0.0/8"},
+			headers: []string{"X-Forwarded-For"},
+			remote:  "10.1.2.3:1234",
+			reqHeads: map[string]string{
+				"X-Forwarded-For": "bad, 198.51.100.11, 198.51.100.12",
+			},
+			want: "198.51.100.11",
+		},
+		{
+			name:    "invalid trusted headers fall back to peer",
+			trusted: []string{"10.0.0.0/8"},
+			remote:  "10.1.2.3:1234",
+			reqHeads: map[string]string{
+				"CF-Connecting-IP": "not-an-ip",
+			},
+			want: "10.1.2.3",
+		},
+		{
+			name:    "trusted exact ipv6 proxy",
+			trusted: []string{"::1"},
+			remote:  "[::1]:1234",
+			reqHeads: map[string]string{
+				"X-Real-IP": "2001:db8::1",
+			},
+			want: "2001:db8::1",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := mustClientIPResolver(t, tc.trusted, tc.headers)
+			req := httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+			req.RemoteAddr = tc.remote
+			for k, v := range tc.reqHeads {
+				req.Header.Set(k, v)
+			}
+			if got := resolver.clientIP(req); got != tc.want {
+				t.Fatalf("clientIP = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -383,6 +585,15 @@ func testApp(st *store.Store) *app {
 		stations:   map[string]*stationRuntime{"monthly": rt, testStationUUID: rt},
 		stationIDs: []string{testStationUUID},
 	}
+}
+
+func mustClientIPResolver(t *testing.T, trustedCIDRs, headers []string) clientIPResolver {
+	t.Helper()
+	resolver, err := newClientIPResolver(trustedCIDRs, headers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolver
 }
 
 func requireFFmpeg(t *testing.T) {

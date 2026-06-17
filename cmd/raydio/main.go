@@ -12,11 +12,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,6 +29,8 @@ import (
 	"raydio/internal/settings"
 	"raydio/internal/store"
 	"raydio/web"
+
+	"golang.org/x/time/rate"
 )
 
 type config struct {
@@ -34,6 +40,10 @@ type config struct {
 	CacheDir           string
 	DBPath             string
 	Radios             []radioConfig
+	RateLimitRPS       float64
+	RateLimitBurst     int
+	TrustedProxyCIDRs  []string
+	ClientIPHeaders    []string
 	ScheduleInterval   time.Duration
 	StreamChunkWindow  time.Duration
 	StreamBufferWindow time.Duration
@@ -134,6 +144,10 @@ func readConfig(args []string) (config, error) {
 		CacheDir:           layout.CacheDir,
 		DBPath:             layout.DBPath,
 		Radios:             radios,
+		RateLimitRPS:       fileCfg.Server.RateLimitRPS,
+		RateLimitBurst:     fileCfg.Server.RateLimitBurst,
+		TrustedProxyCIDRs:  append([]string(nil), fileCfg.Server.TrustedProxyCIDRs...),
+		ClientIPHeaders:    append([]string(nil), fileCfg.Server.ClientIPHeaders...),
 		ScheduleInterval:   fileCfg.Server.ScheduleInterval,
 		StreamChunkWindow:  fileCfg.Server.StreamChunkWindow,
 		StreamBufferWindow: fileCfg.Server.StreamBufferWindow,
@@ -145,6 +159,10 @@ func readConfig(args []string) (config, error) {
 
 func run(ctx context.Context, cfg config) error {
 	if err := validateConfig(cfg); err != nil {
+		return err
+	}
+	clientIPs, err := newClientIPResolver(cfg.TrustedProxyCIDRs, cfg.ClientIPHeaders)
+	if err != nil {
 		return err
 	}
 	if err := paths.RequireServerCache(cfg.CacheDir, cfg.GapFrames); err != nil {
@@ -184,7 +202,7 @@ func run(ctx context.Context, cfg config) error {
 		stations[r.Alias] = rt
 		stationIDs = append(stationIDs, r.UUID)
 	}
-	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
+	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "rate_limit_rps", cfg.RateLimitRPS, "rate_limit_burst", cfg.RateLimitBurst, "trusted_proxy_cidrs", cfg.TrustedProxyCIDRs, "client_ip_headers", cfg.ClientIPHeaders, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
 
 	webFiles, err := loadWebFiles()
 	if err != nil {
@@ -196,7 +214,7 @@ func run(ctx context.Context, cfg config) error {
 	a.routes(mux)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           mux,
+		Handler:           newRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, clientIPs, mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -220,6 +238,15 @@ func run(ctx context.Context, cfg config) error {
 }
 
 func validateConfig(cfg config) error {
+	if cfg.RateLimitRPS <= 0 {
+		return fmt.Errorf("rate limit rps must be positive")
+	}
+	if cfg.RateLimitBurst <= 0 {
+		return fmt.Errorf("rate limit burst must be positive")
+	}
+	if _, err := newClientIPResolver(cfg.TrustedProxyCIDRs, cfg.ClientIPHeaders); err != nil {
+		return err
+	}
 	if cfg.ScheduleInterval <= 0 {
 		return fmt.Errorf("schedule interval must be positive")
 	}
@@ -263,7 +290,6 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /radio/{station}/api/events", a.handleEvents)
 	mux.HandleFunc("GET /radio/{station}/api/catalog", a.handleCatalog)
 	mux.HandleFunc("GET /radio/{station}/covers/{id}", a.handleAsset("cover"))
-	mux.HandleFunc("GET /radio/{station}/lyrics/{id}", a.handleAsset("lyrics"))
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 }
 
@@ -366,6 +392,197 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 
 func setWriteDeadline(w http.ResponseWriter, timeout time.Duration) error {
 	return http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
+}
+
+type clientLimiter struct {
+	limiter  *rate.Limiter
+	lastSeen time.Time
+}
+
+type rateLimitMiddleware struct {
+	next      http.Handler
+	rps       float64
+	burst     int
+	resolver  clientIPResolver
+	mu        sync.Mutex
+	clients   map[string]*clientLimiter
+	lastPrune time.Time
+	now       func() time.Time
+}
+
+func newRateLimitMiddleware(rps float64, burst int, resolver clientIPResolver, next http.Handler) http.Handler {
+	return &rateLimitMiddleware{
+		next:     next,
+		rps:      rps,
+		burst:    burst,
+		resolver: resolver,
+		clients:  map[string]*clientLimiter{},
+		now:      time.Now,
+	}
+}
+
+func (m *rateLimitMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/healthz" {
+		m.next.ServeHTTP(w, r)
+		return
+	}
+	if !m.allow(m.resolver.clientIP(r)) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+	m.next.ServeHTTP(w, r)
+}
+
+func (m *rateLimitMiddleware) allow(ip string) bool {
+	now := m.now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pruneLocked(now)
+	entry := m.clients[ip]
+	if entry == nil {
+		entry = &clientLimiter{limiter: rate.NewLimiter(rate.Limit(m.rps), m.burst)}
+		m.clients[ip] = entry
+	}
+	entry.lastSeen = now
+	return entry.limiter.AllowN(now, 1)
+}
+
+func (m *rateLimitMiddleware) pruneLocked(now time.Time) {
+	if !m.lastPrune.IsZero() && now.Sub(m.lastPrune) < time.Minute {
+		return
+	}
+	m.lastPrune = now
+	for ip, entry := range m.clients {
+		if now.Sub(entry.lastSeen) > 5*time.Minute {
+			delete(m.clients, ip)
+		}
+	}
+}
+
+type clientIPResolver struct {
+	trustedProxies []netip.Prefix
+	headers        []string
+}
+
+var defaultClientIPHeaders = []string{"CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"}
+
+func newClientIPResolver(trustedCIDRs, headers []string) (clientIPResolver, error) {
+	if headers == nil {
+		headers = defaultClientIPHeaders
+	}
+	resolver := clientIPResolver{
+		headers: make([]string, 0, len(headers)),
+	}
+	for _, raw := range headers {
+		header, ok := normalizeClientIPHeader(raw)
+		if strings.TrimSpace(raw) == "" {
+			return clientIPResolver{}, fmt.Errorf("server.client_ip_headers must not contain empty names")
+		}
+		if !ok {
+			return clientIPResolver{}, fmt.Errorf("server.client_ip_headers contains unsupported header %q", raw)
+		}
+		resolver.headers = append(resolver.headers, header)
+	}
+	for _, raw := range trustedCIDRs {
+		prefix, err := parseTrustedProxyPrefix(raw)
+		if err != nil {
+			return clientIPResolver{}, err
+		}
+		resolver.trustedProxies = append(resolver.trustedProxies, prefix)
+	}
+	return resolver, nil
+}
+
+func normalizeClientIPHeader(raw string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "cf-connecting-ip":
+		return "CF-Connecting-IP", true
+	case "x-forwarded-for":
+		return "X-Forwarded-For", true
+	case "x-real-ip":
+		return "X-Real-IP", true
+	default:
+		return "", false
+	}
+}
+
+func parseTrustedProxyPrefix(raw string) (netip.Prefix, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return netip.Prefix{}, fmt.Errorf("server.trusted_proxy_cidrs must not contain empty values")
+	}
+	if prefix, err := netip.ParsePrefix(value); err == nil {
+		return prefix.Masked(), nil
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("server.trusted_proxy_cidrs contains invalid value %q", raw)
+	}
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
+}
+
+func (r clientIPResolver) clientIP(req *http.Request) string {
+	peer, ok, fallback := remoteAddrIP(req.RemoteAddr)
+	if !ok {
+		return fallback
+	}
+	if !r.trusts(peer) {
+		return peer.String()
+	}
+	for _, header := range r.headers {
+		switch header {
+		case "CF-Connecting-IP", "X-Real-IP":
+			if addr, ok := parseHeaderIP(req.Header.Get(header)); ok {
+				return addr.String()
+			}
+		case "X-Forwarded-For":
+			if addr, ok := parseXForwardedFor(req.Header.Get(header)); ok {
+				return addr.String()
+			}
+		}
+	}
+	return peer.String()
+}
+
+func (r clientIPResolver) trusts(peer netip.Addr) bool {
+	for _, prefix := range r.trustedProxies {
+		if prefix.Contains(peer) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteAddrIP(remoteAddr string) (netip.Addr, bool, string) {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	host = strings.TrimSpace(host)
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.Addr{}, false, host
+	}
+	addr = addr.Unmap()
+	return addr, true, addr.String()
+}
+
+func parseHeaderIP(raw string) (netip.Addr, bool) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(raw))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return addr.Unmap(), true
+}
+
+func parseXForwardedFor(raw string) (netip.Addr, bool) {
+	for _, part := range strings.Split(raw, ",") {
+		if addr, ok := parseHeaderIP(part); ok {
+			return addr, true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 func (a *app) handleNow(w http.ResponseWriter, r *http.Request) {

@@ -25,29 +25,19 @@ const (
 	FrameDurationMs int64 = 24
 )
 
-type Tags struct {
-	Title   string
-	Artist  string
-	Album   string
-	Comment string
-}
-
 type Probe struct {
 	Format struct {
-		Duration string            `json:"duration"`
-		BitRate  string            `json:"bit_rate"`
-		Tags     map[string]string `json:"tags"`
+		Duration string `json:"duration"`
+		BitRate  string `json:"bit_rate"`
 	} `json:"format"`
 	Streams []struct {
-		CodecType     string            `json:"codec_type"`
-		CodecName     string            `json:"codec_name"`
-		SampleRate    string            `json:"sample_rate"`
-		Channels      int64             `json:"channels"`
-		BitRate       string            `json:"bit_rate"`
-		Duration      string            `json:"duration"`
-		Disposition   map[string]int    `json:"disposition"`
-		Tags          map[string]string `json:"tags"`
-		ChannelLayout string            `json:"channel_layout"`
+		CodecType     string `json:"codec_type"`
+		CodecName     string `json:"codec_name"`
+		SampleRate    string `json:"sample_rate"`
+		Channels      int64  `json:"channels"`
+		BitRate       string `json:"bit_rate"`
+		Duration      string `json:"duration"`
+		ChannelLayout string `json:"channel_layout"`
 	} `json:"streams"`
 }
 
@@ -74,37 +64,6 @@ func FFprobe(ctx context.Context, path string) (Probe, error) {
 		return Probe{}, err
 	}
 	return p, nil
-}
-
-func TagsFromProbe(p Probe) Tags {
-	merged := map[string]string{}
-	for k, v := range p.Format.Tags {
-		merged[strings.ToLower(k)] = v
-	}
-	for _, st := range p.Streams {
-		if st.CodecType != "audio" {
-			continue
-		}
-		for k, v := range st.Tags {
-			merged[strings.ToLower(k)] = v
-		}
-		break
-	}
-	return Tags{
-		Title:   firstNonEmpty(merged["title"], merged["tit2"]),
-		Artist:  firstNonEmpty(merged["artist"], merged["album_artist"], merged["tpe1"]),
-		Album:   firstNonEmpty(merged["album"], merged["talb"]),
-		Comment: firstNonEmpty(merged["comment"], merged["description"]),
-	}
-}
-
-func HasAttachedPicture(p Probe) bool {
-	for _, st := range p.Streams {
-		if st.CodecType == "video" && st.Disposition["attached_pic"] == 1 {
-			return true
-		}
-	}
-	return false
 }
 
 func TranscodeCleanMP3(ctx context.Context, input, output string) error {
@@ -172,32 +131,6 @@ func EnsureSilence(ctx context.Context, output string, frames int64) error {
 	if v.FrameCount < frames {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("silence has %d frames, want at least %d", v.FrameCount, frames)
-	}
-	return os.Rename(tmp, output)
-}
-
-func ExtractEmbeddedCover(ctx context.Context, input, output string) error {
-	if err := os.MkdirAll(filepath.Dir(output), 0o755); err != nil {
-		return err
-	}
-	tmp := output + ".tmp"
-	_ = os.Remove(tmp)
-	args := []string{
-		"-nostdin", "-hide_banner", "-loglevel", "error",
-		"-i", input,
-		"-map", "0:v:0", "-an", "-frames:v", "1",
-		"-update", "1", tmp,
-	}
-	if err := run(ctx, "ffmpeg", args...); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if info, err := os.Stat(tmp); err != nil || info.Size() == 0 {
-		_ = os.Remove(tmp)
-		if err != nil {
-			return err
-		}
-		return errors.New("empty cover")
 	}
 	return os.Rename(tmp, output)
 }
@@ -300,15 +233,13 @@ func validateFrameSizes(ctx context.Context, path string) (int64, error) {
 }
 
 func audioStream(p Probe) (struct {
-	CodecType     string            `json:"codec_type"`
-	CodecName     string            `json:"codec_name"`
-	SampleRate    string            `json:"sample_rate"`
-	Channels      int64             `json:"channels"`
-	BitRate       string            `json:"bit_rate"`
-	Duration      string            `json:"duration"`
-	Disposition   map[string]int    `json:"disposition"`
-	Tags          map[string]string `json:"tags"`
-	ChannelLayout string            `json:"channel_layout"`
+	CodecType     string `json:"codec_type"`
+	CodecName     string `json:"codec_name"`
+	SampleRate    string `json:"sample_rate"`
+	Channels      int64  `json:"channels"`
+	BitRate       string `json:"bit_rate"`
+	Duration      string `json:"duration"`
+	ChannelLayout string `json:"channel_layout"`
 }, error) {
 	for _, st := range p.Streams {
 		if st.CodecType == "audio" {
@@ -316,15 +247,13 @@ func audioStream(p Probe) (struct {
 		}
 	}
 	return struct {
-		CodecType     string            `json:"codec_type"`
-		CodecName     string            `json:"codec_name"`
-		SampleRate    string            `json:"sample_rate"`
-		Channels      int64             `json:"channels"`
-		BitRate       string            `json:"bit_rate"`
-		Duration      string            `json:"duration"`
-		Disposition   map[string]int    `json:"disposition"`
-		Tags          map[string]string `json:"tags"`
-		ChannelLayout string            `json:"channel_layout"`
+		CodecType     string `json:"codec_type"`
+		CodecName     string `json:"codec_name"`
+		SampleRate    string `json:"sample_rate"`
+		Channels      int64  `json:"channels"`
+		BitRate       string `json:"bit_rate"`
+		Duration      string `json:"duration"`
+		ChannelLayout string `json:"channel_layout"`
 	}{}, errors.New("no audio stream")
 }
 
