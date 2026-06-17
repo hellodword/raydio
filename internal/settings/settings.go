@@ -32,6 +32,8 @@ type Server struct {
 	Addr               string
 	RateLimitRPS       float64
 	RateLimitBurst     int
+	MaxStreamsPerIP    int
+	MaxEventsPerIP     int
 	TrustedProxyCIDRs  []string
 	ClientIPHeaders    []string
 	ScheduleInterval   time.Duration
@@ -41,8 +43,10 @@ type Server struct {
 }
 
 type Suno struct {
-	SyncInterval time.Duration
-	HTTPTimeout  time.Duration
+	SyncInterval  time.Duration
+	HTTPTimeout   time.Duration
+	MaxAudioBytes int64
+	MaxCoverBytes int64
 }
 
 type Worker struct {
@@ -69,6 +73,8 @@ type rawServer struct {
 	Addr               *string  `yaml:"addr"`
 	RateLimitRPS       *float64 `yaml:"rate_limit_rps"`
 	RateLimitBurst     *int     `yaml:"rate_limit_burst"`
+	MaxStreamsPerIP    *int     `yaml:"max_streams_per_ip"`
+	MaxEventsPerIP     *int     `yaml:"max_events_per_ip"`
 	TrustedProxyCIDRs  []string `yaml:"trusted_proxy_cidrs"`
 	ClientIPHeaders    []string `yaml:"client_ip_headers"`
 	ScheduleInterval   *string  `yaml:"schedule_interval"`
@@ -78,8 +84,10 @@ type rawServer struct {
 }
 
 type rawSuno struct {
-	SyncInterval *string `yaml:"sync_interval"`
-	HTTPTimeout  *string `yaml:"http_timeout"`
+	SyncInterval  *string `yaml:"sync_interval"`
+	HTTPTimeout   *string `yaml:"http_timeout"`
+	MaxAudioBytes *int64  `yaml:"max_audio_bytes"`
+	MaxCoverBytes *int64  `yaml:"max_cover_bytes"`
 }
 
 type rawWorker struct {
@@ -96,6 +104,8 @@ func Defaults() File {
 			Addr:               ":8080",
 			RateLimitRPS:       10,
 			RateLimitBurst:     30,
+			MaxStreamsPerIP:    4,
+			MaxEventsPerIP:     8,
 			ClientIPHeaders:    defaultClientIPHeaders(),
 			ScheduleInterval:   time.Minute,
 			StreamChunkWindow:  480 * time.Millisecond,
@@ -103,8 +113,10 @@ func Defaults() File {
 			StreamWriteTimeout: 5 * time.Second,
 		},
 		Suno: Suno{
-			SyncInterval: 30 * time.Minute,
-			HTTPTimeout:  30 * time.Second,
+			SyncInterval:  30 * time.Minute,
+			HTTPTimeout:   30 * time.Second,
+			MaxAudioBytes: 128 * 1024 * 1024,
+			MaxCoverBytes: 16 * 1024 * 1024,
 		},
 		Worker: Worker{
 			RescanInterval: 30 * time.Second,
@@ -167,6 +179,12 @@ func parseYAML(b []byte, cfg *File) error {
 	if raw.Server.RateLimitBurst != nil {
 		cfg.Server.RateLimitBurst = *raw.Server.RateLimitBurst
 	}
+	if raw.Server.MaxStreamsPerIP != nil {
+		cfg.Server.MaxStreamsPerIP = *raw.Server.MaxStreamsPerIP
+	}
+	if raw.Server.MaxEventsPerIP != nil {
+		cfg.Server.MaxEventsPerIP = *raw.Server.MaxEventsPerIP
+	}
 	if raw.Server.TrustedProxyCIDRs != nil {
 		cfg.Server.TrustedProxyCIDRs = append([]string(nil), raw.Server.TrustedProxyCIDRs...)
 	}
@@ -191,6 +209,12 @@ func parseYAML(b []byte, cfg *File) error {
 	if err := parseOptionalDuration(raw.Suno.HTTPTimeout, "suno.http_timeout", &cfg.Suno.HTTPTimeout); err != nil {
 		return err
 	}
+	if raw.Suno.MaxAudioBytes != nil {
+		cfg.Suno.MaxAudioBytes = *raw.Suno.MaxAudioBytes
+	}
+	if raw.Suno.MaxCoverBytes != nil {
+		cfg.Suno.MaxCoverBytes = *raw.Suno.MaxCoverBytes
+	}
 	if raw.Worker.InboxDir != nil {
 		cfg.Worker.InboxDir = *raw.Worker.InboxDir
 	}
@@ -200,7 +224,7 @@ func parseYAML(b []byte, cfg *File) error {
 	if raw.Radios != nil {
 		cfg.Radios = make([]Radio, 0, len(raw.Radios))
 		for _, r := range raw.Radios {
-			cfg.Radios = append(cfg.Radios, Radio{Alias: r.Alias, UUID: r.UUID})
+			cfg.Radios = append(cfg.Radios, Radio(r))
 		}
 	}
 	if err := validateServer(cfg); err != nil {

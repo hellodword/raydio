@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -50,6 +51,9 @@ type Syncer struct {
 	client         *Client
 	logger         *slog.Logger
 	maxConcurrency int
+	maxAudioBytes  int64
+	maxCoverBytes  int64
+	retries        int
 }
 
 type Result struct {
@@ -114,7 +118,23 @@ func NewSyncer(client *Client, logger *slog.Logger) *Syncer {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Syncer{client: client, logger: logger, maxConcurrency: 4}
+	return &Syncer{
+		client:         client,
+		logger:         logger,
+		maxConcurrency: 4,
+		maxAudioBytes:  128 * 1024 * 1024,
+		maxCoverBytes:  16 * 1024 * 1024,
+		retries:        2,
+	}
+}
+
+func (s *Syncer) SetDownloadLimits(maxAudioBytes, maxCoverBytes int64) {
+	if maxAudioBytes > 0 {
+		s.maxAudioBytes = maxAudioBytes
+	}
+	if maxCoverBytes > 0 {
+		s.maxCoverBytes = maxCoverBytes
+	}
 }
 
 func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
@@ -135,12 +155,20 @@ func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
 	}
 	nextManifest := Manifest{Files: map[string][]string{}}
 	active := map[string]struct{}{}
+	unique := map[string]struct{}{}
 	var mu sync.Mutex
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.maxConcurrency)
 	for _, clip := range clips {
 		clip := clip
 		key := clipKey(clip)
+		if _, ok := unique[key]; ok {
+			mu.Lock()
+			result.Skipped++
+			mu.Unlock()
+			continue
+		}
+		unique[key] = struct{}{}
 		active[key] = struct{}{}
 		g.Go(func() error {
 			files, downloaded, skipped, err := s.syncClip(gctx, radio.InboxDir, key, clip)
@@ -186,7 +214,7 @@ func (s *Syncer) syncClip(ctx context.Context, dir, key string, clip Clip) ([]st
 	downloaded := 0
 	skipped := 0
 	if clip.ImageURL != "" {
-		coverExt, wrote, err := downloadWithExt(ctx, s.client.httpClient, s.client.baseURL, clip.ImageURL, filepath.Join(dir, key), true)
+		coverExt, wrote, err := downloadWithExt(ctx, s.client.httpClient, s.client.baseURL, clip.ImageURL, filepath.Join(dir, key), true, s.maxCoverBytes, s.retries)
 		if err != nil {
 			return files, downloaded, skipped, err
 		}
@@ -199,7 +227,7 @@ func (s *Syncer) syncClip(ctx context.Context, dir, key string, clip Clip) ([]st
 			}
 		}
 	}
-	wrote, err := downloadFile(ctx, s.client.httpClient, s.client.baseURL, clip.AudioURL, filepath.Join(dir, key+".mp3"), false)
+	wrote, err := downloadFile(ctx, s.client.httpClient, s.client.baseURL, clip.AudioURL, filepath.Join(dir, key+".mp3"), false, s.maxAudioBytes, s.retries)
 	files = append(files, key+".mp3")
 	if err != nil {
 		return files, downloaded, skipped, err
@@ -273,12 +301,22 @@ func safeName(name string) string {
 	return out
 }
 
-func downloadWithExt(ctx context.Context, client *http.Client, baseURL, rawURL, base string, skipExisting bool) (string, bool, error) {
-	ext := extFromURL(rawURL)
+func downloadWithExt(ctx context.Context, client *http.Client, baseURL, rawURL, base string, skipExisting bool, maxBytes int64, retries int) (string, bool, error) {
 	resolved, err := resolveURL(baseURL, rawURL)
 	if err != nil {
 		return "", false, err
 	}
+	var ext string
+	var wrote bool
+	err = retryDownload(ctx, retries, func() error {
+		var err error
+		ext, wrote, err = downloadWithExtOnce(ctx, client, resolved, base, skipExisting, maxBytes)
+		return err
+	})
+	return ext, wrote, err
+}
+
+func downloadWithExtOnce(ctx context.Context, client *http.Client, resolved, base string, skipExisting bool, maxBytes int64) (string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resolved, nil)
 	if err != nil {
 		return "", false, err
@@ -286,23 +324,21 @@ func downloadWithExt(ctx context.Context, client *http.Client, baseURL, rawURL, 
 	req.Header.Set("user-agent", defaultUserAgent)
 	res, err := client.Do(req)
 	if err != nil {
-		return "", false, err
+		return "", false, downloadErr{err: err, retryable: true}
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return "", false, fmt.Errorf("download %s returned %s", resolved, res.Status)
+		return "", false, downloadErr{err: fmt.Errorf("download %s returned %s", resolved, res.Status), retryable: retryableStatus(res.StatusCode)}
 	}
-	if byType := extFromContentType(res.Header.Get("Content-Type")); byType != "" {
-		ext = byType
-	}
+	ext := extFromContentType(res.Header.Get("Content-Type"))
 	if ext == "" {
-		ext = ".jpg"
+		return "", false, fmt.Errorf("download %s returned unsupported cover content-type %q", resolved, res.Header.Get("Content-Type"))
 	}
-	wrote, err := writeResponseBody(res.Body, base+ext, skipExisting)
+	wrote, err := writeResponseBody(res.Body, base+ext, skipExisting, maxBytes)
 	return ext, wrote, err
 }
 
-func downloadFile(ctx context.Context, client *http.Client, baseURL, rawURL, path string, overwrite bool) (bool, error) {
+func downloadFile(ctx context.Context, client *http.Client, baseURL, rawURL, path string, overwrite bool, maxBytes int64, retries int) (bool, error) {
 	if !overwrite && existingNonEmpty(path) {
 		return false, nil
 	}
@@ -310,6 +346,16 @@ func downloadFile(ctx context.Context, client *http.Client, baseURL, rawURL, pat
 	if err != nil {
 		return false, err
 	}
+	var wrote bool
+	err = retryDownload(ctx, retries, func() error {
+		var err error
+		wrote, err = downloadFileOnce(ctx, client, resolved, path, overwrite, maxBytes)
+		return err
+	})
+	return wrote, err
+}
+
+func downloadFileOnce(ctx context.Context, client *http.Client, resolved, path string, overwrite bool, maxBytes int64) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, resolved, nil)
 	if err != nil {
 		return false, err
@@ -317,32 +363,75 @@ func downloadFile(ctx context.Context, client *http.Client, baseURL, rawURL, pat
 	req.Header.Set("user-agent", defaultUserAgent)
 	res, err := client.Do(req)
 	if err != nil {
-		return false, err
+		return false, downloadErr{err: err, retryable: true}
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return false, fmt.Errorf("download %s returned %s", resolved, res.Status)
+		return false, downloadErr{err: fmt.Errorf("download %s returned %s", resolved, res.Status), retryable: retryableStatus(res.StatusCode)}
 	}
-	return writeResponseBody(res.Body, path, !overwrite)
+	if !isAudioContentType(res.Header.Get("Content-Type")) {
+		return false, fmt.Errorf("download %s returned unsupported audio content-type %q", resolved, res.Header.Get("Content-Type"))
+	}
+	return writeResponseBody(res.Body, path, !overwrite, maxBytes)
 }
 
-func writeResponseBody(r io.Reader, path string, skipExisting bool) (bool, error) {
+type downloadErr struct {
+	err       error
+	retryable bool
+}
+
+func (e downloadErr) Error() string {
+	return e.err.Error()
+}
+
+func retryDownload(ctx context.Context, retries int, fn func() error) error {
+	var err error
+	for attempt := 0; attempt <= retries; attempt++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		var d downloadErr
+		if !errors.As(err, &d) || !d.retryable || attempt == retries {
+			return err
+		}
+		timer := time.NewTimer(time.Duration(attempt+1) * 100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= 500
+}
+
+func writeResponseBody(r io.Reader, path string, skipExisting bool, maxBytes int64) (bool, error) {
 	if skipExisting && existingNonEmpty(path) {
 		return false, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return false, err
 	}
-	tmp := path + ".tmp"
-	out, err := os.Create(tmp)
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return false, err
 	}
-	_, copyErr := io.Copy(out, r)
-	closeErr := out.Close()
+	tmp := tmpFile.Name()
+	limited := &io.LimitedReader{R: r, N: maxBytes + 1}
+	_, copyErr := io.Copy(tmpFile, limited)
+	closeErr := tmpFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
 		return false, copyErr
+	}
+	if limited.N == 0 {
+		_ = os.Remove(tmp)
+		return false, fmt.Errorf("download exceeds %d bytes", maxBytes)
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmp)
@@ -355,8 +444,23 @@ func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, perm); err != nil {
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write(b); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Chmod(perm); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -365,20 +469,6 @@ func writeFileAtomic(path string, b []byte, perm os.FileMode) error {
 func existingNonEmpty(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir() && info.Size() > 0
-}
-
-func extFromURL(rawURL string) string {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return ""
-	}
-	ext := strings.ToLower(filepath.Ext(u.Path))
-	switch ext {
-	case ".jpg", ".jpeg", ".png", ".webp":
-		return ext
-	default:
-		return ""
-	}
 }
 
 func resolveURL(baseURL, rawURL string) (string, error) {
@@ -410,6 +500,19 @@ func extFromContentType(contentType string) string {
 		return ".webp"
 	default:
 		return ""
+	}
+}
+
+func isAudioContentType(contentType string) bool {
+	typ, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	switch typ {
+	case "audio/mpeg", "audio/mp3", "audio/mpeg3":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -450,10 +553,11 @@ func deleteStale(dir string, manifest Manifest, active map[string]struct{}) (int
 			continue
 		}
 		for _, name := range files {
-			if name == "" || filepath.IsAbs(name) || strings.Contains(name, "..") {
+			path, ok := cleanManifestPath(dir, name)
+			if !ok {
 				continue
 			}
-			err := os.Remove(filepath.Join(dir, name))
+			err := os.Remove(path)
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
@@ -464,4 +568,17 @@ func deleteStale(dir string, manifest Manifest, active map[string]struct{}) (int
 		}
 	}
 	return deleted, nil
+}
+
+func cleanManifestPath(dir, name string) (string, bool) {
+	if name == "" || filepath.IsAbs(name) {
+		return "", false
+	}
+	root := filepath.Clean(dir)
+	path := filepath.Join(root, filepath.Clean(name))
+	rel, err := filepath.Rel(root, filepath.Clean(path))
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return path, true
 }

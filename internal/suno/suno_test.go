@@ -120,6 +120,7 @@ func TestSyncRadioSkipsExistingMP3AndDeletesStaleManifestFiles(t *testing.T) {
 				]
 			}`))
 		case "/audio/clip-a.mp3":
+			w.Header().Set("Content-Type", "audio/mpeg")
 			_, _ = w.Write([]byte("new"))
 		default:
 			http.NotFound(w, r)
@@ -144,6 +145,156 @@ func TestSyncRadioSkipsExistingMP3AndDeletesStaleManifestFiles(t *testing.T) {
 		t.Fatalf("stale exists err=%v", err)
 	}
 	assertFile(t, filepath.Join(dir, "manual.mp3"), "manual")
+}
+
+func TestSyncRadioRejectsOversizedAudio(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/playlist/" + testUUID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"playlist_clips": [
+					{"clip": {"id":"clip-a","status":"complete","title":"Song A","handle":"Artist A","audio_url":"/audio/clip-a.mp3"}}
+				]
+			}`))
+		case "/audio/clip-a.mp3":
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = w.Write([]byte("too-large"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	syncer := NewSyncer(NewClient(srv.URL, rewriteClient(srv.Client(), srv.URL)), nil)
+	syncer.SetDownloadLimits(3, 1024)
+	result, err := syncer.SyncRadio(context.Background(), Radio{Alias: "monthly", UUID: testUUID, InboxDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Errors != 1 || result.Downloaded != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "clip-a.mp3")); !os.IsNotExist(err) {
+		t.Fatalf("oversized file exists err=%v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, "*.tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("leftover tmp files = %+v", matches)
+	}
+}
+
+func TestSyncRadioRejectsInvalidContentType(t *testing.T) {
+	dir := t.TempDir()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/playlist/" + testUUID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"playlist_clips": [
+					{"clip": {"id":"clip-a","status":"complete","title":"Song A","handle":"Artist A","audio_url":"/audio/clip-a.mp3"}}
+				]
+			}`))
+		case "/audio/clip-a.mp3":
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("mp3"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := NewSyncer(NewClient(srv.URL, rewriteClient(srv.Client(), srv.URL)), nil).SyncRadio(context.Background(), Radio{
+		Alias:    "monthly",
+		UUID:     testUUID,
+		InboxDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Errors != 1 || result.Downloaded != 0 {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestSyncRadioRetriesTransientDownload(t *testing.T) {
+	dir := t.TempDir()
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/playlist/" + testUUID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"playlist_clips": [
+					{"clip": {"id":"clip-a","status":"complete","title":"Song A","handle":"Artist A","audio_url":"/audio/clip-a.mp3"}}
+				]
+			}`))
+		case "/audio/clip-a.mp3":
+			hits++
+			if hits == 1 {
+				http.Error(w, "try again", http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = w.Write([]byte("mp3"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := NewSyncer(NewClient(srv.URL, rewriteClient(srv.Client(), srv.URL)), nil).SyncRadio(context.Background(), Radio{
+		Alias:    "monthly",
+		UUID:     testUUID,
+		InboxDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hits != 2 || result.Downloaded != 1 || result.Errors != 0 {
+		t.Fatalf("hits=%d result=%+v", hits, result)
+	}
+	assertFile(t, filepath.Join(dir, "clip-a.mp3"), "mp3")
+}
+
+func TestSyncRadioDeduplicatesClipKeys(t *testing.T) {
+	dir := t.TempDir()
+	var downloads int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/playlist/" + testUUID:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{
+				"playlist_clips": [
+					{"clip": {"id":"clip-a","status":"complete","title":"Song A","handle":"Artist A","audio_url":"/audio/clip-a.mp3"}},
+					{"clip": {"id":"clip-a","status":"complete","title":"Song A Duplicate","handle":"Artist A","audio_url":"/audio/clip-a-duplicate.mp3"}}
+				]
+			}`))
+		case "/audio/clip-a.mp3", "/audio/clip-a-duplicate.mp3":
+			downloads++
+			w.Header().Set("Content-Type", "audio/mpeg")
+			_, _ = w.Write([]byte("mp3"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := NewSyncer(NewClient(srv.URL, rewriteClient(srv.Client(), srv.URL)), nil).SyncRadio(context.Background(), Radio{
+		Alias:    "monthly",
+		UUID:     testUUID,
+		InboxDir: dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if downloads != 1 || result.Downloaded != 1 || result.Skipped != 1 || result.Errors != 0 {
+		t.Fatalf("downloads=%d result=%+v", downloads, result)
+	}
 }
 
 func rewriteClient(client *http.Client, baseURL string) *http.Client {

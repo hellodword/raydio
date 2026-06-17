@@ -116,6 +116,9 @@ func run(ctx context.Context, cfg config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
+	if err := cleanupStaleTempFiles(ctx, cfg.CacheDir, time.Hour); err != nil {
+		return err
+	}
 	slog.Info("starting raydio-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "rescan_interval", cfg.RescanInterval, "gap_frames", cfg.GapFrames)
 	st, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
@@ -353,6 +356,45 @@ func scan(ctx context.Context, cat catalogRuntime) error {
 		slog.Debug("catalog scan finished", attrs...)
 	}
 	return nil
+}
+
+func cleanupStaleTempFiles(ctx context.Context, root string, olderThan time.Duration) error {
+	info, err := os.Stat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return nil
+	}
+	cutoff := time.Now().Add(-olderThan)
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".tmp") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	})
 }
 
 func minInt(a, b int) int {

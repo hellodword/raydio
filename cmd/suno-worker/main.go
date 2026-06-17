@@ -21,13 +21,15 @@ import (
 )
 
 type config struct {
-	ConfigPath   string
-	DataDir      string
-	InboxDir     string
-	Radios       []radioConfig
-	SyncInterval time.Duration
-	HTTPTimeout  time.Duration
-	LogLevel     slog.Level
+	ConfigPath    string
+	DataDir       string
+	InboxDir      string
+	Radios        []radioConfig
+	SyncInterval  time.Duration
+	HTTPTimeout   time.Duration
+	MaxAudioBytes int64
+	MaxCoverBytes int64
+	LogLevel      slog.Level
 }
 
 type radioConfig struct {
@@ -93,13 +95,15 @@ func readConfig(args []string) (config, error) {
 		})
 	}
 	return config{
-		ConfigPath:   configPath,
-		DataDir:      layout.DataDir,
-		InboxDir:     layout.InboxDir,
-		Radios:       radios,
-		SyncInterval: fileCfg.Suno.SyncInterval,
-		HTTPTimeout:  fileCfg.Suno.HTTPTimeout,
-		LogLevel:     fileCfg.LogLevel,
+		ConfigPath:    configPath,
+		DataDir:       layout.DataDir,
+		InboxDir:      layout.InboxDir,
+		Radios:        radios,
+		SyncInterval:  fileCfg.Suno.SyncInterval,
+		HTTPTimeout:   fileCfg.Suno.HTTPTimeout,
+		MaxAudioBytes: fileCfg.Suno.MaxAudioBytes,
+		MaxCoverBytes: fileCfg.Suno.MaxCoverBytes,
+		LogLevel:      fileCfg.LogLevel,
 	}, nil
 }
 
@@ -109,7 +113,8 @@ func run(ctx context.Context, cfg config) error {
 	}
 	client := suno.NewClient(suno.DefaultBaseURL, &http.Client{Timeout: cfg.HTTPTimeout})
 	syncer := suno.NewSyncer(client, slog.Default())
-	slog.Info("starting suno-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "radios", len(cfg.Radios), "sync_interval", cfg.SyncInterval, "http_timeout", cfg.HTTPTimeout)
+	syncer.SetDownloadLimits(cfg.MaxAudioBytes, cfg.MaxCoverBytes)
+	slog.Info("starting suno-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "radios", len(cfg.Radios), "sync_interval", cfg.SyncInterval, "http_timeout", cfg.HTTPTimeout, "max_audio_bytes", cfg.MaxAudioBytes, "max_cover_bytes", cfg.MaxCoverBytes)
 	if err := syncAll(ctx, syncer, cfg.Radios); err != nil {
 		return err
 	}
@@ -136,6 +141,12 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.HTTPTimeout <= 0 {
 		return fmt.Errorf("suno http timeout must be positive")
+	}
+	if cfg.MaxAudioBytes <= 0 {
+		return fmt.Errorf("suno max audio bytes must be positive")
+	}
+	if cfg.MaxCoverBytes <= 0 {
+		return fmt.Errorf("suno max cover bytes must be positive")
 	}
 	if len(cfg.Radios) == 0 {
 		return fmt.Errorf("at least one radio is required")

@@ -21,6 +21,8 @@ server:
   addr: ":18080"
   rate_limit_rps: 7.5
   rate_limit_burst: 11
+  max_streams_per_ip: 3
+  max_events_per_ip: 6
   trusted_proxy_cidrs:
     - 127.0.0.1
     - 10.0.0.0/8
@@ -39,6 +41,8 @@ worker:
 suno:
   sync_interval: 45m
   http_timeout: 12s
+  max_audio_bytes: 12345
+  max_cover_bytes: 2345
 
 radios:
   - alias: monthly
@@ -69,6 +73,12 @@ radios:
 	if cfg.Server.RateLimitBurst != 11 {
 		t.Fatalf("Server.RateLimitBurst = %d", cfg.Server.RateLimitBurst)
 	}
+	if cfg.Server.MaxStreamsPerIP != 3 {
+		t.Fatalf("Server.MaxStreamsPerIP = %d", cfg.Server.MaxStreamsPerIP)
+	}
+	if cfg.Server.MaxEventsPerIP != 6 {
+		t.Fatalf("Server.MaxEventsPerIP = %d", cfg.Server.MaxEventsPerIP)
+	}
 	if strings.Join(cfg.Server.TrustedProxyCIDRs, ",") != "127.0.0.1/32,10.0.0.0/8" {
 		t.Fatalf("Server.TrustedProxyCIDRs = %+v", cfg.Server.TrustedProxyCIDRs)
 	}
@@ -98,6 +108,12 @@ radios:
 	}
 	if cfg.Suno.HTTPTimeout != 12*time.Second {
 		t.Fatalf("Suno.HTTPTimeout = %s", cfg.Suno.HTTPTimeout)
+	}
+	if cfg.Suno.MaxAudioBytes != 12345 {
+		t.Fatalf("Suno.MaxAudioBytes = %d", cfg.Suno.MaxAudioBytes)
+	}
+	if cfg.Suno.MaxCoverBytes != 2345 {
+		t.Fatalf("Suno.MaxCoverBytes = %d", cfg.Suno.MaxCoverBytes)
 	}
 	if len(cfg.Radios) != 1 || cfg.Radios[0].Alias != "monthly" || cfg.Radios[0].UUID != "00000000-0000-0000-0000-000000000001" {
 		t.Fatalf("Radios = %+v", cfg.Radios)
@@ -136,6 +152,12 @@ radios:
 	if cfg.Server.RateLimitBurst != 30 {
 		t.Fatalf("Server.RateLimitBurst = %d", cfg.Server.RateLimitBurst)
 	}
+	if cfg.Server.MaxStreamsPerIP != 4 {
+		t.Fatalf("Server.MaxStreamsPerIP = %d", cfg.Server.MaxStreamsPerIP)
+	}
+	if cfg.Server.MaxEventsPerIP != 8 {
+		t.Fatalf("Server.MaxEventsPerIP = %d", cfg.Server.MaxEventsPerIP)
+	}
 	if len(cfg.Server.TrustedProxyCIDRs) != 0 {
 		t.Fatalf("Server.TrustedProxyCIDRs = %+v", cfg.Server.TrustedProxyCIDRs)
 	}
@@ -159,6 +181,12 @@ radios:
 	}
 	if cfg.Suno.HTTPTimeout != 30*time.Second {
 		t.Fatalf("Suno.HTTPTimeout = %s", cfg.Suno.HTTPTimeout)
+	}
+	if cfg.Suno.MaxAudioBytes != 128*1024*1024 {
+		t.Fatalf("Suno.MaxAudioBytes = %d", cfg.Suno.MaxAudioBytes)
+	}
+	if cfg.Suno.MaxCoverBytes != 16*1024*1024 {
+		t.Fatalf("Suno.MaxCoverBytes = %d", cfg.Suno.MaxCoverBytes)
 	}
 }
 

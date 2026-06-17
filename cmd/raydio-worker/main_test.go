@@ -281,6 +281,34 @@ func TestIgnoredPathFiltersHiddenTempAndPartialFiles(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleTempFiles(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	oldTmp := filepath.Join(root, "old.tmp")
+	newTmp := filepath.Join(root, "new.tmp")
+	regular := filepath.Join(root, "keep.mp3")
+	for _, path := range []string{oldTmp, newTmp, regular} {
+		if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldTime := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(oldTmp, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupStaleTempFiles(ctx, root, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(oldTmp); !os.IsNotExist(err) {
+		t.Fatalf("old tmp exists err=%v", err)
+	}
+	for _, path := range []string{newTmp, regular} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s missing: %v", path, err)
+		}
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

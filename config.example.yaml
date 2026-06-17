@@ -1,10 +1,5 @@
 # Raydio configuration.
 # Copy this file to config.yaml before starting raydio-worker and raydio.
-#
-# All processes read the same config file:
-#   CGO_ENABLED=1 go run ./cmd/raydio-worker
-#   CGO_ENABLED=1 go run ./cmd/suno-worker
-#   CGO_ENABLED=1 go run ./cmd/raydio
 
 # Root data directory. Raydio stores the SQLite database and media cache here.
 data_dir: ./data
@@ -85,6 +80,12 @@ server:
   # Per-client-IP burst size for HTTP request limiting.
   rate_limit_burst: 30
 
+  # Maximum concurrent MP3 streams allowed from one client IP.
+  max_streams_per_ip: 4
+
+  # Maximum concurrent server-sent event streams allowed from one client IP.
+  max_events_per_ip: 8
+
   # CIDRs or exact IPs for reverse proxies whose client-IP headers are trusted.
   # Keep empty unless raydio is only reachable through those proxies.
   # Examples for local Nginx/cloudflared:
@@ -115,6 +116,12 @@ suno:
 
   # HTTP timeout for Suno playlist and media downloads.
   http_timeout: 30s
+
+  # Maximum bytes accepted for a downloaded Suno MP3.
+  max_audio_bytes: 134217728
+
+  # Maximum bytes accepted for a downloaded Suno cover image.
+  max_cover_bytes: 16777216
 
 worker:
   # Base source MP3 directory scanned by raydio-worker.

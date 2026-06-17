@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"embed"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/pressly/goose/v3"
 )
 
 const (
@@ -20,12 +18,119 @@ const (
 	TrackStatusError   = "error"
 )
 
+const currentSchemaSQL = `
+CREATE TABLE stations (
+	uuid TEXT PRIMARY KEY,
+	alias TEXT NOT NULL UNIQUE,
+	enabled INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL
+);
+
+CREATE TABLE tracks (
+	id TEXT PRIMARY KEY,
+	station_uuid TEXT NOT NULL,
+	content_hash TEXT NOT NULL,
+	source_path TEXT NOT NULL,
+	source_size INTEGER NOT NULL,
+	source_mod_unix INTEGER NOT NULL,
+	cache_path TEXT NOT NULL,
+	title TEXT NOT NULL,
+	artist TEXT NOT NULL,
+	album TEXT NOT NULL DEFAULT '',
+	duration_ms INTEGER NOT NULL,
+	frame_count INTEGER NOT NULL,
+	frame_size INTEGER NOT NULL,
+	bitrate INTEGER NOT NULL,
+	sample_rate INTEGER NOT NULL,
+	channels INTEGER NOT NULL,
+	status TEXT NOT NULL,
+	error TEXT,
+	created_at TEXT NOT NULL,
+	updated_at TEXT NOT NULL,
+	FOREIGN KEY (station_uuid) REFERENCES stations(uuid)
+);
+
+CREATE INDEX idx_tracks_source_path_lookup ON tracks(station_uuid, source_path);
+CREATE INDEX idx_tracks_title_nocase ON tracks(title COLLATE NOCASE, id);
+CREATE INDEX idx_tracks_status_title_nocase ON tracks(station_uuid, status, title COLLATE NOCASE, id);
+
+CREATE TABLE track_assets (
+	track_id TEXT NOT NULL,
+	kind TEXT NOT NULL CHECK (kind = 'cover'),
+	path TEXT NOT NULL,
+	mime TEXT NOT NULL,
+	updated_at TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (track_id, kind),
+	FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE schedule_slots (
+	id TEXT PRIMARY KEY,
+	station_uuid TEXT NOT NULL,
+	start_unix_ms INTEGER NOT NULL,
+	end_unix_ms INTEGER NOT NULL,
+	track_id TEXT,
+	is_silence INTEGER NOT NULL,
+	frame_count INTEGER NOT NULL,
+	created_at TEXT NOT NULL,
+	FOREIGN KEY (station_uuid) REFERENCES stations(uuid),
+	FOREIGN KEY (track_id) REFERENCES tracks(id)
+);
+
+CREATE INDEX idx_schedule_slots_time ON schedule_slots(station_uuid, start_unix_ms, end_unix_ms);
+CREATE INDEX idx_schedule_slots_end ON schedule_slots(station_uuid, end_unix_ms);
+
+CREATE TABLE catalog_state (
+	station_uuid TEXT PRIMARY KEY,
+	revision INTEGER NOT NULL DEFAULT 0,
+	updated_at TEXT NOT NULL DEFAULT '',
+	FOREIGN KEY (station_uuid) REFERENCES stations(uuid)
+);
+
+CREATE TRIGGER trg_tracks_catalog_revision_insert
+	AFTER INSERT ON tracks
+	BEGIN
+		UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = NEW.station_uuid;
+	END;
+
+CREATE TRIGGER trg_tracks_catalog_revision_update
+	AFTER UPDATE ON tracks
+	BEGIN
+		UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = NEW.station_uuid;
+	END;
+
+CREATE TRIGGER trg_tracks_catalog_revision_delete
+	AFTER DELETE ON tracks
+	BEGIN
+		UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = OLD.station_uuid;
+	END;
+
+CREATE TRIGGER trg_track_assets_catalog_revision_insert
+	AFTER INSERT ON track_assets
+	BEGIN
+		UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
+		WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = NEW.track_id);
+	END;
+
+CREATE TRIGGER trg_track_assets_catalog_revision_update
+	AFTER UPDATE ON track_assets
+	BEGIN
+		UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
+		WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = NEW.track_id);
+	END;
+
+CREATE TRIGGER trg_track_assets_catalog_revision_delete
+	AFTER DELETE ON track_assets
+	BEGIN
+		UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
+		WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = OLD.track_id);
+	END;
+`
+
 type Store struct {
 	db *sql.DB
 }
-
-//go:embed migrations/*.sql
-var migrationFS embed.FS
 
 type CatalogRevision struct {
 	Revision  int64
@@ -146,20 +251,23 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if !hasGoose {
-		hasTables, err := s.hasUserTables(ctx)
-		if err != nil {
-			return err
-		}
-		if hasTables {
-			return errors.New("database has a legacy non-goose schema; remove or recreate the SQLite database before starting this version")
-		}
+	if hasGoose {
+		return errors.New("database uses legacy goose migrations; remove or recreate the SQLite database before starting this version")
 	}
-	goose.SetBaseFS(migrationFS)
-	if err := goose.SetDialect("sqlite3"); err != nil {
+	tables, err := s.userTables(ctx)
+	if err != nil {
 		return err
 	}
-	return goose.UpContext(ctx, s.db, "migrations")
+	if len(tables) == 0 {
+		if _, err := s.db.ExecContext(ctx, currentSchemaSQL); err != nil {
+			return err
+		}
+		return s.validateCurrentSchema(ctx)
+	}
+	if err := validateKnownTables(tables); err != nil {
+		return err
+	}
+	return s.validateCurrentSchema(ctx)
 }
 
 func (s *Store) hasTable(ctx context.Context, name string) (bool, error) {
@@ -168,23 +276,98 @@ func (s *Store) hasTable(ctx context.Context, name string) (bool, error) {
 	return count != 0, err
 }
 
-func (s *Store) hasUserTables(ctx context.Context) (bool, error) {
+func (s *Store) userTables(ctx context.Context) (map[string]struct{}, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM sqlite_master WHERE type='table'`)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer rows.Close()
+	out := map[string]struct{}{}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return false, err
+			return nil, err
 		}
-		if name == "goose_db_version" || strings.HasPrefix(name, "sqlite_") {
+		if strings.HasPrefix(name, "sqlite_") {
 			continue
 		}
-		return true, nil
+		out[name] = struct{}{}
 	}
-	return false, rows.Err()
+	return out, rows.Err()
+}
+
+var currentTables = map[string]struct{}{
+	"stations":       {},
+	"tracks":         {},
+	"track_assets":   {},
+	"schedule_slots": {},
+	"catalog_state":  {},
+}
+
+var currentIndexes = []string{
+	"idx_tracks_source_path_lookup",
+	"idx_tracks_title_nocase",
+	"idx_tracks_status_title_nocase",
+	"idx_schedule_slots_time",
+	"idx_schedule_slots_end",
+}
+
+var currentTriggers = []string{
+	"trg_tracks_catalog_revision_insert",
+	"trg_tracks_catalog_revision_update",
+	"trg_tracks_catalog_revision_delete",
+	"trg_track_assets_catalog_revision_insert",
+	"trg_track_assets_catalog_revision_update",
+	"trg_track_assets_catalog_revision_delete",
+}
+
+func validateKnownTables(tables map[string]struct{}) error {
+	if len(tables) != len(currentTables) {
+		return errors.New("database has an unsupported existing schema; remove or recreate the SQLite database before starting this version")
+	}
+	for name := range tables {
+		if _, ok := currentTables[name]; !ok {
+			return errors.New("database has an unsupported existing schema; remove or recreate the SQLite database before starting this version")
+		}
+	}
+	return nil
+}
+
+func (s *Store) validateCurrentSchema(ctx context.Context) error {
+	for name := range currentTables {
+		ok, err := s.hasTable(ctx, name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("database schema missing table %s; remove or recreate the SQLite database before starting this version", name)
+		}
+	}
+	for _, name := range currentIndexes {
+		ok, err := s.hasObject(ctx, "index", name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("database schema missing index %s; remove or recreate the SQLite database before starting this version", name)
+		}
+	}
+	for _, name := range currentTriggers {
+		ok, err := s.hasObject(ctx, "trigger", name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("database schema missing trigger %s; remove or recreate the SQLite database before starting this version", name)
+		}
+	}
+	return nil
+}
+
+func (s *Store) hasObject(ctx context.Context, typ, name string) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type=? AND name=?`, typ, name).Scan(&count)
+	return count != 0, err
 }
 
 func (s *Store) UpsertStation(ctx context.Context, st Station) error {
@@ -334,28 +517,6 @@ func (s *Store) Asset(ctx context.Context, stationUUID, trackID, kind string) (A
 		return Asset{}, err
 	}
 	return a, nil
-}
-
-func (s *Store) ListAssets(ctx context.Context, stationUUID string) ([]Asset, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT a.track_id, a.kind, a.path, a.mime
-		FROM track_assets a
-		JOIN tracks t ON t.id=a.track_id
-		WHERE t.station_uuid=?
-		ORDER BY a.track_id, a.kind`, stationUUID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []Asset
-	for rows.Next() {
-		var a Asset
-		if err := rows.Scan(&a.TrackID, &a.Kind, &a.Path, &a.MIME); err != nil {
-			return nil, err
-		}
-		out = append(out, a)
-	}
-	return out, rows.Err()
 }
 
 func (s *Store) CatalogRevision(ctx context.Context, stationUUID string) (CatalogRevision, error) {
@@ -527,6 +688,23 @@ func (s *Store) Track(ctx context.Context, id string) (Track, error) {
 	return t, rows.Err()
 }
 
+func (s *Store) TrackBySource(ctx context.Context, stationUUID, sourcePath string) (Track, error) {
+	rows, err := s.db.QueryContext(ctx, selectTracksSQL()+` WHERE station_uuid=? AND source_path=? AND status<>? ORDER BY updated_at DESC LIMIT 1`,
+		stationUUID, sourcePath, TrackStatusMissing)
+	if err != nil {
+		return Track{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return Track{}, sql.ErrNoRows
+	}
+	t, err := scanTrack(rows)
+	if err != nil {
+		return Track{}, err
+	}
+	return t, rows.Err()
+}
+
 func (s *Store) listTracks(ctx context.Context, suffix string, args ...any) ([]Track, error) {
 	rows, err := s.db.QueryContext(ctx, selectTracksSQL()+` `+suffix, args...)
 	if err != nil {
@@ -665,22 +843,6 @@ func (s *Store) LastSlot(ctx context.Context, stationUUID string) (Slot, error) 
 	}
 	sl.IsSilence = isSilence != 0
 	return sl, nil
-}
-
-func (s *Store) SetSetting(ctx context.Context, key, value string) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO settings(key, value, updated_at) VALUES (?, ?, ?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
-		key, value, time.Now().UTC().Format(time.RFC3339Nano))
-	return err
-}
-
-func (s *Store) Setting(ctx context.Context, key string) (string, error) {
-	var value string
-	err := s.db.QueryRowContext(ctx, `SELECT value FROM settings WHERE key=?`, key).Scan(&value)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return value, err
 }
 
 func nullableString(ns sql.NullString) any {

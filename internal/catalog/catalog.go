@@ -45,8 +45,9 @@ type ScanResult struct {
 
 type scanCandidate struct {
 	path string
-	info os.FileInfo
 }
+
+var mediaSlots = make(chan struct{}, 4)
 
 func New(cfg Config, st *store.Store) *Service {
 	if cfg.StableDelay == 0 {
@@ -99,13 +100,8 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 			return nil
 		}
 		result.Seen++
-		stable, info, err := stableFile(path, s.cfg.StableDelay)
-		if err != nil || !stable {
-			result.Skipped++
-			return nil
-		}
 		seen[path] = struct{}{}
-		candidates = append(candidates, scanCandidate{path: path, info: info})
+		candidates = append(candidates, scanCandidate{path: path})
 		return nil
 	})
 	if err != nil {
@@ -120,12 +116,33 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 			if err := gctx.Err(); err != nil {
 				return err
 			}
-			changed, err := s.processFile(gctx, candidate.path, candidate.info)
+			stable, info, err := stableFile(gctx, candidate.path, s.cfg.StableDelay)
+			if err != nil {
+				if gctx.Err() != nil {
+					return gctx.Err()
+				}
+				mu.Lock()
+				result.Skipped++
+				mu.Unlock()
+				return nil
+			}
+			if !stable {
+				mu.Lock()
+				result.Skipped++
+				mu.Unlock()
+				return nil
+			}
+			changed, err := s.processFile(gctx, candidate.path, info)
+			if err != nil && gctx.Err() == nil {
+				_ = s.markFileError(gctx, candidate.path, err)
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
+				if gctx.Err() != nil {
+					return gctx.Err()
+				}
 				result.Errors++
-				_ = s.markFileError(context.Background(), candidate.path, err)
 				return nil
 			}
 			if changed {
@@ -154,30 +171,46 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 }
 
 func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo) (bool, error) {
-	sum, err := fileSHA256(path)
-	if err != nil {
+	if old, err := s.store.TrackBySource(ctx, s.cfg.StationUUID, path); err == nil && sourceUnchanged(old, info) && existingNonEmpty(old.CachePath) {
+		if err := s.syncAssets(ctx, old.ID, path); err != nil {
+			return false, err
+		}
+		return false, nil
+	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	contentHash := hex.EncodeToString(sum[:])
-	id := stationTrackID(s.cfg.StationUUID, contentHash)
-	cachePath := filepath.Join(s.cfg.CacheDir, "tracks", contentHash+".mp3")
+
+	var contentHash string
+	var id string
+	var cachePath string
+	var v audio.Validation
 	changed := false
-	if _, err := os.Stat(cachePath); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return false, err
+	if err := withMediaSlot(ctx, func() error {
+		sum, err := fileSHA256(path)
+		if err != nil {
+			return err
 		}
-		if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
-			return false, err
+		contentHash = hex.EncodeToString(sum[:])
+		id = stationTrackID(s.cfg.StationUUID, contentHash)
+		cachePath = filepath.Join(s.cfg.CacheDir, "tracks", contentHash+".mp3")
+		if _, err := os.Stat(cachePath); err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
+				return err
+			}
+			changed = true
+		} else if _, err := audio.ValidateCleanMP3(ctx, cachePath); err != nil {
+			if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
+				return err
+			}
+			changed = true
 		}
-		changed = true
-	} else if _, err := audio.ValidateCleanMP3(ctx, cachePath); err != nil {
-		if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
-			return false, err
-		}
-		changed = true
-	}
-	v, err := audio.ValidateCleanMP3(ctx, cachePath)
-	if err != nil {
+		var validateErr error
+		v, validateErr = audio.ValidateCleanMP3(ctx, cachePath)
+		return validateErr
+	}); err != nil {
 		return false, err
 	}
 
@@ -215,6 +248,20 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 		return false, err
 	}
 	return changed, nil
+}
+
+func sourceUnchanged(old store.Track, info os.FileInfo) bool {
+	return old.SourceSize == info.Size() && old.SourceModUnix == info.ModTime().Unix() && old.Status == store.TrackStatusActive
+}
+
+func withMediaSlot(ctx context.Context, fn func() error) error {
+	select {
+	case mediaSlots <- struct{}{}:
+		defer func() { <-mediaSlots }()
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func trackChanged(old, next store.Track) bool {
@@ -283,12 +330,18 @@ func isCandidate(path, name string) bool {
 	return strings.EqualFold(filepath.Ext(path), ".mp3")
 }
 
-func stableFile(path string, delay time.Duration) (bool, os.FileInfo, error) {
+func stableFile(ctx context.Context, path string, delay time.Duration) (bool, os.FileInfo, error) {
 	info1, err := os.Stat(path)
 	if err != nil {
 		return false, nil, err
 	}
-	time.Sleep(delay)
+	timer := time.NewTimer(delay)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return false, nil, ctx.Err()
+	case <-timer.C:
+	}
 	info2, err := os.Stat(path)
 	if err != nil {
 		return false, nil, err
@@ -324,13 +377,13 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	tmp := dst + ".tmp"
-	out, err := os.Create(tmp)
+	tmpFile, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".*.tmp")
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
-	closeErr := out.Close()
+	tmp := tmpFile.Name()
+	_, copyErr := io.Copy(tmpFile, in)
+	closeErr := tmpFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tmp)
 		return copyErr
@@ -340,6 +393,11 @@ func copyFile(src, dst string) error {
 		return closeErr
 	}
 	return os.Rename(tmp, dst)
+}
+
+func existingNonEmpty(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
 func replaceExt(path, ext string) string {

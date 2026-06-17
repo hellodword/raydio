@@ -11,13 +11,19 @@ import (
 const testStationUUID = "00000000-0000-0000-0000-000000000001"
 
 func TestValidateConfigRejectsInvalidValues(t *testing.T) {
-	if err := validateConfig(config{SyncInterval: 0, HTTPTimeout: time.Second, Radios: []radioConfig{{UUID: testStationUUID}}}); err == nil {
+	if err := validateConfig(config{SyncInterval: 0, HTTPTimeout: time.Second, MaxAudioBytes: 1, MaxCoverBytes: 1, Radios: []radioConfig{{UUID: testStationUUID}}}); err == nil {
 		t.Fatal("expected non-positive sync interval to fail validation")
 	}
-	if err := validateConfig(config{SyncInterval: time.Second, HTTPTimeout: 0, Radios: []radioConfig{{UUID: testStationUUID}}}); err == nil {
+	if err := validateConfig(config{SyncInterval: time.Second, HTTPTimeout: 0, MaxAudioBytes: 1, MaxCoverBytes: 1, Radios: []radioConfig{{UUID: testStationUUID}}}); err == nil {
 		t.Fatal("expected non-positive http timeout to fail validation")
 	}
-	if err := validateConfig(config{SyncInterval: time.Second, HTTPTimeout: time.Second}); err == nil {
+	if err := validateConfig(config{SyncInterval: time.Second, HTTPTimeout: time.Second, MaxAudioBytes: 0, MaxCoverBytes: 1, Radios: []radioConfig{{UUID: testStationUUID}}}); err == nil {
+		t.Fatal("expected non-positive max audio bytes to fail validation")
+	}
+	if err := validateConfig(config{SyncInterval: time.Second, HTTPTimeout: time.Second, MaxAudioBytes: 1, MaxCoverBytes: 0, Radios: []radioConfig{{UUID: testStationUUID}}}); err == nil {
+		t.Fatal("expected non-positive max cover bytes to fail validation")
+	}
+	if err := validateConfig(config{SyncInterval: time.Second, HTTPTimeout: time.Second, MaxAudioBytes: 1, MaxCoverBytes: 1}); err == nil {
 		t.Fatal("expected empty radios to fail validation")
 	}
 }
@@ -32,6 +38,8 @@ worker:
 suno:
   sync_interval: 45m
   http_timeout: 12s
+  max_audio_bytes: 12345
+  max_cover_bytes: 2345
 radios:
   - alias: monthly
     uuid: "00000000-0000-0000-0000-000000000001"
@@ -54,6 +62,12 @@ radios:
 	}
 	if cfg.HTTPTimeout != 12*time.Second {
 		t.Fatalf("HTTPTimeout = %s", cfg.HTTPTimeout)
+	}
+	if cfg.MaxAudioBytes != 12345 {
+		t.Fatalf("MaxAudioBytes = %d", cfg.MaxAudioBytes)
+	}
+	if cfg.MaxCoverBytes != 2345 {
+		t.Fatalf("MaxCoverBytes = %d", cfg.MaxCoverBytes)
 	}
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("LogLevel = %s", cfg.LogLevel)

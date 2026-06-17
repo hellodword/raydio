@@ -53,7 +53,6 @@ Third-party Go dependencies:
 ```text
 github.com/mattn/go-sqlite3 v1.14.44
 github.com/fsnotify/fsnotify v1.10.1
-github.com/pressly/goose/v3 v3.27.1
 golang.org/x/sync v0.21.0
 golang.org/x/time v0.15.0
 go.yaml.in/yaml/v4 v4.0.0-rc.5
@@ -147,6 +146,8 @@ Supported keys:
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.rate_limit_rps` | `10` | Per-client-IP HTTP request rate limit. `/healthz` is exempt. |
 | `server.rate_limit_burst` | `30` | Per-client-IP burst size for HTTP rate limiting. |
+| `server.max_streams_per_ip` | `4` | Maximum concurrent MP3 streams per client IP. |
+| `server.max_events_per_ip` | `8` | Maximum concurrent SSE event streams per client IP. |
 | `server.trusted_proxy_cidrs` | `[]` | Reverse proxy CIDRs or exact IPs whose client-IP headers are trusted. |
 | `server.client_ip_headers` | `["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]` | Header order used only for trusted proxies. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
@@ -155,6 +156,8 @@ Supported keys:
 | `server.stream_write_timeout` | `5s` | Maximum blocking time for a listener write. |
 | `suno.sync_interval` | `30m` | How often `suno-worker` syncs configured Suno playlists. |
 | `suno.http_timeout` | `30s` | HTTP timeout for Suno playlist and media downloads. |
+| `suno.max_audio_bytes` | `134217728` | Maximum bytes accepted for one downloaded Suno MP3. |
+| `suno.max_cover_bytes` | `16777216` | Maximum bytes accepted for one downloaded Suno cover image. |
 | `worker.inbox_dir` | empty | Base source MP3 directory. Empty means `<data_dir>/inbox`. |
 | `worker.rescan_interval` | `30s` | Directory rescan interval. |
 
@@ -233,9 +236,6 @@ stale files it previously managed; manual inbox files are not deleted.
 500 tracks and pass the returned `nextCursor` as `cursor` to read the next page.
 Responses include `revision`, `tracks`, `nextCursor`, and `hasMore`, and support
 `ETag` revalidation.
-
-The legacy `/radio`, `/api/now`, `/api/events`, and `/api/catalog` paths are not
-registered and return 404.
 
 `/radio/{uuid-or-alias}` sends:
 
@@ -371,19 +371,17 @@ synchronous=NORMAL
 
 Main tables:
 
-- `goose_db_version`
 - `stations`
 - `tracks`
 - `track_assets`
 - `schedule_slots`
 - `catalog_state`
-- `settings`
 
-Schema creation uses embedded goose migrations. Databases created by older
-hand-managed Raydio schemas do not auto-migrate; if an existing SQLite database
-has application tables but no `goose_db_version` table, startup fails with an
-operator-facing error. Remove or recreate the database to start with the current
-fresh schema.
+Schema creation is fresh-only. Empty databases are initialized directly with the
+current schema. Databases containing historical migration tables such as
+`goose_db_version`, the removed `settings` table, or any unknown application
+tables fail startup with an operator-facing error. Remove or recreate the
+database to start with the current fresh schema.
 
 ## Playback From Terminal
 
@@ -455,6 +453,8 @@ server:
   addr: "127.0.0.1:18080"
   rate_limit_rps: 10
   rate_limit_burst: 30
+  max_streams_per_ip: 4
+  max_events_per_ip: 8
   trusted_proxy_cidrs: []
   client_ip_headers: ["CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"]
   schedule_interval: 1m
@@ -464,6 +464,8 @@ server:
 suno:
   sync_interval: 30m
   http_timeout: 30s
+  max_audio_bytes: 134217728
+  max_cover_bytes: 16777216
 worker:
   inbox_dir: ""
   rescan_interval: 30s

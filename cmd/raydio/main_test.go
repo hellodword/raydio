@@ -26,6 +26,8 @@ func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	cfg := config{
 		RateLimitRPS:       10,
 		RateLimitBurst:     30,
+		MaxStreamsPerIP:    4,
+		MaxEventsPerIP:     8,
 		ScheduleInterval:   0,
 		StreamChunkWindow:  time.Millisecond,
 		StreamBufferWindow: time.Second,
@@ -41,6 +43,8 @@ func TestValidateConfigRejectsInvalidRateLimit(t *testing.T) {
 	cfg := config{
 		RateLimitRPS:       0,
 		RateLimitBurst:     30,
+		MaxStreamsPerIP:    4,
+		MaxEventsPerIP:     8,
 		ScheduleInterval:   time.Second,
 		StreamChunkWindow:  minStreamChunkWindow,
 		StreamBufferWindow: time.Second,
@@ -78,6 +82,8 @@ server:
   addr: ":18080"
   rate_limit_rps: 5.5
   rate_limit_burst: 12
+  max_streams_per_ip: 3
+  max_events_per_ip: 6
   trusted_proxy_cidrs:
     - 127.0.0.1
     - 10.0.0.0/8
@@ -122,6 +128,12 @@ radios:
 	if cfg.RateLimitBurst != 12 {
 		t.Fatalf("RateLimitBurst = %d", cfg.RateLimitBurst)
 	}
+	if cfg.MaxStreamsPerIP != 3 {
+		t.Fatalf("MaxStreamsPerIP = %d", cfg.MaxStreamsPerIP)
+	}
+	if cfg.MaxEventsPerIP != 6 {
+		t.Fatalf("MaxEventsPerIP = %d", cfg.MaxEventsPerIP)
+	}
 	if strings.Join(cfg.TrustedProxyCIDRs, ",") != "127.0.0.1/32,10.0.0.0/8" {
 		t.Fatalf("TrustedProxyCIDRs = %+v", cfg.TrustedProxyCIDRs)
 	}
@@ -159,6 +171,8 @@ func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
 		DBPath:             layout.DBPath,
 		RateLimitRPS:       10,
 		RateLimitBurst:     30,
+		MaxStreamsPerIP:    4,
+		MaxEventsPerIP:     8,
 		ScheduleInterval:   time.Second,
 		StreamChunkWindow:  minStreamChunkWindow,
 		StreamBufferWindow: time.Second,
@@ -199,6 +213,8 @@ func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
 			DBPath:             layout.DBPath,
 			RateLimitRPS:       10,
 			RateLimitBurst:     30,
+			MaxStreamsPerIP:    4,
+			MaxEventsPerIP:     8,
 			ScheduleInterval:   5 * time.Millisecond,
 			StreamChunkWindow:  minStreamChunkWindow,
 			StreamBufferWindow: time.Second,
@@ -340,20 +356,6 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 	}
 }
 
-func TestRoutesRejectLegacyRadioAndAPIPaths(t *testing.T) {
-	a := testApp(nil)
-	mux := http.NewServeMux()
-	a.routes(mux)
-	for _, path := range []string{"/radio", "/api/now", "/api/events", "/api/catalog", "/radio/monthly/lyrics/aaa"} {
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		rr := httptest.NewRecorder()
-		mux.ServeHTTP(rr, req)
-		if rr.Code != http.StatusNotFound {
-			t.Fatalf("%s status = %d, want 404", path, rr.Code)
-		}
-	}
-}
-
 func TestRateLimitMiddlewareLimitsAPIAndExemptsHealthz(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/stations", func(w http.ResponseWriter, r *http.Request) {
@@ -388,6 +390,17 @@ func TestRateLimitMiddlewareLimitsAPIAndExemptsHealthz(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("healthz status = %d", rr.Code)
 		}
+	}
+}
+
+func TestRateLimitMiddlewareUsesShards(t *testing.T) {
+	handler := newRateLimitMiddleware(10, 10, mustClientIPResolver(t, nil, nil), http.NewServeMux())
+	m, ok := handler.(*rateLimitMiddleware)
+	if !ok {
+		t.Fatalf("handler type = %T", handler)
+	}
+	if len(m.shards) < 2 {
+		t.Fatalf("shards = %d, want at least 2", len(m.shards))
 	}
 }
 
@@ -426,6 +439,26 @@ func TestRateLimitMiddlewareSeparatesClientsBehindTrustedProxy(t *testing.T) {
 	}
 }
 
+func TestIPConnectionLimiterLimitsAndReleasesByClient(t *testing.T) {
+	limiter := newIPConnectionLimiter(1, mustClientIPResolver(t, []string{"10.0.0.0/8"}, nil))
+	req := httptest.NewRequest(http.MethodGet, "/radio/monthly", nil)
+	req.RemoteAddr = "10.1.2.3:1234"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.10")
+	release, ok := limiter.acquire(req)
+	if !ok {
+		t.Fatal("first acquire rejected")
+	}
+	if _, ok := limiter.acquire(req); ok {
+		t.Fatal("second acquire should be rejected")
+	}
+	release()
+	release, ok = limiter.acquire(req)
+	if !ok {
+		t.Fatal("acquire after release rejected")
+	}
+	release()
+}
+
 func TestClientIPResolver(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -453,14 +486,14 @@ func TestClientIPResolver(t *testing.T) {
 			want: "198.51.100.10",
 		},
 		{
-			name:    "trusted proxy uses first valid forwarded for",
+			name:    "trusted proxy rejects invalid first forwarded for",
 			trusted: []string{"10.0.0.0/8"},
 			headers: []string{"X-Forwarded-For"},
 			remote:  "10.1.2.3:1234",
 			reqHeads: map[string]string{
 				"X-Forwarded-For": "bad, 198.51.100.11, 198.51.100.12",
 			},
-			want: "198.51.100.11",
+			want: "10.1.2.3",
 		},
 		{
 			name:    "invalid trusted headers fall back to peer",
@@ -509,8 +542,31 @@ func TestHandleStationsReturnsConfiguredStations(t *testing.T) {
 	}
 }
 
+func TestHandleCatalogInternalErrorIsGeneric(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a := testApp(st)
+	req := httptest.NewRequest(http.MethodGet, "/radio/monthly/api/catalog", nil)
+	req.SetPathValue("station", "monthly")
+	rr := httptest.NewRecorder()
+	a.handleCatalog(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "internal server error") || strings.Contains(strings.ToLower(rr.Body.String()), "database") {
+		t.Fatalf("leaked internal error body = %q", rr.Body.String())
+	}
+}
+
 func TestServeAssetUsesETag(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "cover.jpg")
+	root := t.TempDir()
+	path := filepath.Join(root, "cover.jpg")
 	if err := os.WriteFile(path, []byte("cover"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +574,7 @@ func TestServeAssetUsesETag(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/covers/aaa", nil)
 	rr := httptest.NewRecorder()
-	serveAsset(rr, req, asset)
+	serveAsset(rr, req, asset, root)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
 	}
@@ -530,12 +586,35 @@ func TestServeAssetUsesETag(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/covers/aaa", nil)
 	req.Header.Set("If-None-Match", etag)
 	rr = httptest.NewRecorder()
-	serveAsset(rr, req, asset)
+	serveAsset(rr, req, asset, root)
 	if rr.Code != http.StatusNotModified {
 		t.Fatalf("etag status = %d body = %s", rr.Code, rr.Body.String())
 	}
 	if rr.Body.Len() != 0 {
 		t.Fatalf("304 body = %q", rr.Body.String())
+	}
+}
+
+func TestServeAssetRejectsEscapedPathAndMismatchedMIME(t *testing.T) {
+	dir := t.TempDir()
+	root := filepath.Join(dir, "covers")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside.jpg")
+	if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, asset := range []store.Asset{
+		{TrackID: "aaa", Kind: "cover", Path: outside, MIME: "image/jpeg"},
+		{TrackID: "aaa", Kind: "cover", Path: filepath.Join(root, "cover.png"), MIME: "image/jpeg"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/covers/aaa", nil)
+		rr := httptest.NewRecorder()
+		serveAsset(rr, req, asset, root)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("asset %+v status = %d, want 404", asset, rr.Code)
+		}
 	}
 }
 

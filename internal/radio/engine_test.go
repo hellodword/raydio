@@ -188,7 +188,7 @@ func TestEngineRefreshCachesScheduledAssets(t *testing.T) {
 	}
 }
 
-func TestEngineRefreshCachesAssetsOutsideSchedule(t *testing.T) {
+func TestEngineRefreshDoesNotCacheAssetsOutsideSchedule(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
 	if err != nil {
@@ -245,8 +245,8 @@ func TestEngineRefreshCachesAssetsOutsideSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 	asset, ok := e.Asset(inactive.ID, "cover")
-	if !ok || asset.Path != "/cache/inactive.jpg" {
-		t.Fatalf("cached inactive asset = %+v ok=%v", asset, ok)
+	if ok {
+		t.Fatalf("cached inactive asset = %+v", asset)
 	}
 }
 

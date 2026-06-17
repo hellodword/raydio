@@ -17,7 +17,6 @@ import (
 type Scheduler struct {
 	store       *store.Store
 	stationUUID string
-	silencePath string
 	gapFrames   int64
 	fillAhead   time.Duration
 	mu          sync.Mutex
@@ -32,20 +31,6 @@ type Scheduler struct {
 type trackSet struct {
 	byID map[string]store.Track
 	ids  []string
-}
-
-type Chunk struct {
-	Path   string
-	Offset int64
-	Length int64
-}
-
-type Position struct {
-	Slot       store.Slot
-	Track      *store.Track
-	AssetURLs  map[string]string
-	ElapsedMs  int64
-	DurationMs int64
 }
 
 type Now struct {
@@ -67,11 +52,10 @@ type NowTrack struct {
 	CoverURL string `json:"coverUrl,omitempty"`
 }
 
-func NewScheduler(st *store.Store, stationUUID, silencePath string, gapFrames int64) *Scheduler {
+func NewScheduler(st *store.Store, stationUUID, _ string, gapFrames int64) *Scheduler {
 	return &Scheduler{
 		store:       st,
 		stationUUID: stationUUID,
-		silencePath: silencePath,
 		gapFrames:   gapFrames,
 		fillAhead:   30 * time.Minute,
 		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
@@ -82,115 +66,6 @@ func (s *Scheduler) Ensure(ctx context.Context, now time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.ensureLocked(ctx, now)
-}
-
-func (s *Scheduler) Position(ctx context.Context, now time.Time) (Position, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.positionLocked(ctx, now)
-}
-
-func (s *Scheduler) PositionOrEnsure(ctx context.Context, now time.Time) (Position, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pos, err := s.positionLocked(ctx, now)
-	if err == nil {
-		return pos, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return Position{}, err
-	}
-	if err := s.store.DeleteFutureSlots(ctx, s.stationUUID, now.UnixMilli()); err != nil {
-		return Position{}, err
-	}
-	if err := s.ensureLocked(ctx, now); err != nil {
-		return Position{}, err
-	}
-	return s.positionLocked(ctx, now)
-}
-
-func (s *Scheduler) positionLocked(ctx context.Context, now time.Time) (Position, error) {
-	nowMs := now.UnixMilli()
-	slot, err := s.store.SlotAt(ctx, s.stationUUID, nowMs)
-	if err != nil {
-		return Position{}, err
-	}
-	pos := Position{
-		Slot:       slot,
-		ElapsedMs:  maxInt64(0, nowMs-slot.StartUnixMs),
-		DurationMs: slot.EndUnixMs - slot.StartUnixMs,
-	}
-	if slot.TrackID.Valid {
-		t, err := s.store.Track(ctx, slot.TrackID.String)
-		if err == nil {
-			pos.Track = &t
-			pos.AssetURLs = assetURLs(ctx, s.store, s.stationUUID, t.ID)
-		}
-	}
-	return pos, nil
-}
-
-func (s *Scheduler) Now(ctx context.Context, now time.Time) (Now, error) {
-	pos, err := s.PositionOrEnsure(ctx, now)
-	if err != nil {
-		return Now{}, err
-	}
-	out := Now{
-		ServerTimeMs: now.UnixMilli(),
-		SlotID:       pos.Slot.ID,
-		IsSilence:    pos.Slot.IsSilence,
-		StartedAtMs:  pos.Slot.StartUnixMs,
-		EndsAtMs:     pos.Slot.EndUnixMs,
-		ElapsedMs:    pos.ElapsedMs,
-		DurationMs:   pos.DurationMs,
-	}
-	if pos.Track != nil {
-		out.Track = &NowTrack{
-			ID:       pos.Track.ID,
-			Title:    pos.Track.Title,
-			Artist:   pos.Track.Artist,
-			Album:    pos.Track.Album,
-			CoverURL: pos.AssetURLs["cover"],
-		}
-	}
-	return out, nil
-}
-
-func (s *Scheduler) Chunks(ctx context.Context, now time.Time, frames int64) ([]Chunk, error) {
-	if frames <= 0 {
-		return nil, errors.New("frames must be positive")
-	}
-	var chunks []Chunk
-	cursor := now
-	remaining := frames
-	for remaining > 0 {
-		pos, err := s.PositionOrEnsure(ctx, cursor)
-		if err != nil {
-			return nil, err
-		}
-		frameIndex := pos.ElapsedMs / audio.FrameDurationMs
-		if frameIndex < 0 {
-			frameIndex = 0
-		}
-		if frameIndex >= pos.Slot.FrameCount {
-			cursor = time.UnixMilli(pos.Slot.EndUnixMs)
-			continue
-		}
-		available := pos.Slot.FrameCount - frameIndex
-		use := minInt64(remaining, available)
-		path := s.silencePath
-		if pos.Track != nil {
-			path = pos.Track.CachePath
-		}
-		chunks = append(chunks, Chunk{
-			Path:   path,
-			Offset: frameIndex * audio.FrameSize,
-			Length: use * audio.FrameSize,
-		})
-		remaining -= use
-		cursor = cursor.Add(time.Duration(use*audio.SamplesPerFrame) * time.Second / time.Duration(audio.SampleRate))
-	}
-	return chunks, nil
 }
 
 func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
@@ -301,18 +176,6 @@ func (s *Scheduler) nextTrack(set trackSet) store.Track {
 			return t
 		}
 	}
-}
-
-func assetURLs(ctx context.Context, st *store.Store, stationUUID, trackID string) map[string]string {
-	assets, err := st.AssetsByTrack(ctx, trackID)
-	if err != nil {
-		return map[string]string{}
-	}
-	out := map[string]string{}
-	if _, ok := assets["cover"]; ok {
-		out["cover"] = "/radio/" + stationUUID + "/covers/" + trackID
-	}
-	return out
 }
 
 func framesToMs(frames int64) int64 {

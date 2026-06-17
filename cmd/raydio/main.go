@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"net"
@@ -42,6 +43,8 @@ type config struct {
 	Radios             []radioConfig
 	RateLimitRPS       float64
 	RateLimitBurst     int
+	MaxStreamsPerIP    int
+	MaxEventsPerIP     int
 	TrustedProxyCIDRs  []string
 	ClientIPHeaders    []string
 	ScheduleInterval   time.Duration
@@ -58,6 +61,8 @@ type app struct {
 	stations   map[string]*stationRuntime
 	stationIDs []string
 	webFiles   map[string]webFile
+	streams    *ipConnectionLimiter
+	events     *ipConnectionLimiter
 }
 
 type radioConfig struct {
@@ -146,6 +151,8 @@ func readConfig(args []string) (config, error) {
 		Radios:             radios,
 		RateLimitRPS:       fileCfg.Server.RateLimitRPS,
 		RateLimitBurst:     fileCfg.Server.RateLimitBurst,
+		MaxStreamsPerIP:    fileCfg.Server.MaxStreamsPerIP,
+		MaxEventsPerIP:     fileCfg.Server.MaxEventsPerIP,
 		TrustedProxyCIDRs:  append([]string(nil), fileCfg.Server.TrustedProxyCIDRs...),
 		ClientIPHeaders:    append([]string(nil), fileCfg.Server.ClientIPHeaders...),
 		ScheduleInterval:   fileCfg.Server.ScheduleInterval,
@@ -202,20 +209,31 @@ func run(ctx context.Context, cfg config) error {
 		stations[r.Alias] = rt
 		stationIDs = append(stationIDs, r.UUID)
 	}
-	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "rate_limit_rps", cfg.RateLimitRPS, "rate_limit_burst", cfg.RateLimitBurst, "trusted_proxy_cidrs", cfg.TrustedProxyCIDRs, "client_ip_headers", cfg.ClientIPHeaders, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
+	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "rate_limit_rps", cfg.RateLimitRPS, "rate_limit_burst", cfg.RateLimitBurst, "max_streams_per_ip", cfg.MaxStreamsPerIP, "max_events_per_ip", cfg.MaxEventsPerIP, "trusted_proxy_cidrs", cfg.TrustedProxyCIDRs, "client_ip_headers", cfg.ClientIPHeaders, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
 
 	webFiles, err := loadWebFiles()
 	if err != nil {
 		return err
 	}
-	a := &app{cfg: cfg, store: st, stations: stations, stationIDs: stationIDs, webFiles: webFiles}
+	a := &app{
+		cfg:        cfg,
+		store:      st,
+		stations:   stations,
+		stationIDs: stationIDs,
+		webFiles:   webFiles,
+		streams:    newIPConnectionLimiter(cfg.MaxStreamsPerIP, clientIPs),
+		events:     newIPConnectionLimiter(cfg.MaxEventsPerIP, clientIPs),
+	}
 
 	mux := http.NewServeMux()
 	a.routes(mux)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           newRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, clientIPs, mux),
+		Handler:           newSecurityHeadersMiddleware(newRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, clientIPs, mux)),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 
 	errCh := make(chan error, 1)
@@ -243,6 +261,12 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.RateLimitBurst <= 0 {
 		return fmt.Errorf("rate limit burst must be positive")
+	}
+	if cfg.MaxStreamsPerIP <= 0 {
+		return fmt.Errorf("max streams per ip must be positive")
+	}
+	if cfg.MaxEventsPerIP <= 0 {
+		return fmt.Errorf("max events per ip must be positive")
 	}
 	if _, err := newClientIPResolver(cfg.TrustedProxyCIDRs, cfg.ClientIPHeaders); err != nil {
 		return err
@@ -349,6 +373,12 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	release, ok := a.streams.acquire(r)
+	if !ok {
+		http.Error(w, "too many streams", http.StatusTooManyRequests)
+		return
+	}
+	defer release()
 	slog.Debug("radio stream connected", "remote", r.RemoteAddr)
 	defer slog.Debug("radio stream disconnected", "remote", r.RemoteAddr)
 
@@ -360,7 +390,7 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		internalServerError(w, r, "radio streaming unsupported", nil)
 		return
 	}
 
@@ -391,7 +421,21 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 }
 
 func setWriteDeadline(w http.ResponseWriter, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
 	return http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
+}
+
+func newSecurityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'")
+		next.ServeHTTP(w, r)
+	})
 }
 
 type clientLimiter struct {
@@ -399,26 +443,34 @@ type clientLimiter struct {
 	lastSeen time.Time
 }
 
-type rateLimitMiddleware struct {
-	next      http.Handler
-	rps       float64
-	burst     int
-	resolver  clientIPResolver
+type rateLimitShard struct {
 	mu        sync.Mutex
 	clients   map[string]*clientLimiter
 	lastPrune time.Time
-	now       func() time.Time
+}
+
+type rateLimitMiddleware struct {
+	next     http.Handler
+	rps      float64
+	burst    int
+	resolver clientIPResolver
+	shards   []rateLimitShard
+	now      func() time.Time
 }
 
 func newRateLimitMiddleware(rps float64, burst int, resolver clientIPResolver, next http.Handler) http.Handler {
-	return &rateLimitMiddleware{
+	m := &rateLimitMiddleware{
 		next:     next,
 		rps:      rps,
 		burst:    burst,
 		resolver: resolver,
-		clients:  map[string]*clientLimiter{},
+		shards:   make([]rateLimitShard, 32),
 		now:      time.Now,
 	}
+	for i := range m.shards {
+		m.shards[i].clients = map[string]*clientLimiter{}
+	}
+	return m
 }
 
 func (m *rateLimitMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -435,28 +487,72 @@ func (m *rateLimitMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 func (m *rateLimitMiddleware) allow(ip string) bool {
 	now := m.now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.pruneLocked(now)
-	entry := m.clients[ip]
+	shard := &m.shards[clientShard(ip, len(m.shards))]
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	m.pruneLocked(shard, now)
+	entry := shard.clients[ip]
 	if entry == nil {
 		entry = &clientLimiter{limiter: rate.NewLimiter(rate.Limit(m.rps), m.burst)}
-		m.clients[ip] = entry
+		shard.clients[ip] = entry
 	}
 	entry.lastSeen = now
 	return entry.limiter.AllowN(now, 1)
 }
 
-func (m *rateLimitMiddleware) pruneLocked(now time.Time) {
-	if !m.lastPrune.IsZero() && now.Sub(m.lastPrune) < time.Minute {
+func (m *rateLimitMiddleware) pruneLocked(shard *rateLimitShard, now time.Time) {
+	if !shard.lastPrune.IsZero() && now.Sub(shard.lastPrune) < time.Minute {
 		return
 	}
-	m.lastPrune = now
-	for ip, entry := range m.clients {
+	shard.lastPrune = now
+	for ip, entry := range shard.clients {
 		if now.Sub(entry.lastSeen) > 5*time.Minute {
-			delete(m.clients, ip)
+			delete(shard.clients, ip)
 		}
 	}
+}
+
+func clientShard(ip string, n int) int {
+	if n <= 1 {
+		return 0
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(ip))
+	return int(h.Sum32() % uint32(n))
+}
+
+type ipConnectionLimiter struct {
+	limit    int
+	resolver clientIPResolver
+	mu       sync.Mutex
+	clients  map[string]int
+}
+
+func newIPConnectionLimiter(limit int, resolver clientIPResolver) *ipConnectionLimiter {
+	return &ipConnectionLimiter{limit: limit, resolver: resolver, clients: map[string]int{}}
+}
+
+func (l *ipConnectionLimiter) acquire(r *http.Request) (func(), bool) {
+	if l == nil || l.limit <= 0 {
+		return func() {}, true
+	}
+	ip := l.resolver.clientIP(r)
+	l.mu.Lock()
+	if l.clients[ip] >= l.limit {
+		l.mu.Unlock()
+		return nil, false
+	}
+	l.clients[ip]++
+	l.mu.Unlock()
+	return func() {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.clients[ip] <= 1 {
+			delete(l.clients, ip)
+			return
+		}
+		l.clients[ip]--
+	}, true
 }
 
 type clientIPResolver struct {
@@ -537,9 +633,14 @@ func (r clientIPResolver) clientIP(req *http.Request) string {
 				return addr.String()
 			}
 		case "X-Forwarded-For":
-			if addr, ok := parseXForwardedFor(req.Header.Get(header)); ok {
+			raw := req.Header.Get(header)
+			if raw == "" {
+				continue
+			}
+			if addr, ok := parseXForwardedFor(raw); ok {
 				return addr.String()
 			}
+			return peer.String()
 		}
 	}
 	return peer.String()
@@ -577,12 +678,8 @@ func parseHeaderIP(raw string) (netip.Addr, bool) {
 }
 
 func parseXForwardedFor(raw string) (netip.Addr, bool) {
-	for _, part := range strings.Split(raw, ",") {
-		if addr, ok := parseHeaderIP(part); ok {
-			return addr, true
-		}
-	}
-	return netip.Addr{}, false
+	first, _, _ := strings.Cut(raw, ",")
+	return parseHeaderIP(first)
 }
 
 func (a *app) handleNow(w http.ResponseWriter, r *http.Request) {
@@ -598,6 +695,12 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	release, ok := a.events.acquire(r)
+	if !ok {
+		http.Error(w, "too many event streams", http.StatusTooManyRequests)
+		return
+	}
+	defer release()
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-store, no-transform")
@@ -605,16 +708,28 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		internalServerError(w, r, "event streaming unsupported", nil)
 		return
 	}
 
 	ctx := r.Context()
+	deadlineSupported := true
+	setDeadline := func() {
+		if !deadlineSupported {
+			return
+		}
+		err := setWriteDeadline(w, a.cfg.StreamWriteTimeout)
+		deadlineSupported = err == nil
+		if err != nil {
+			slog.Debug("event write deadline unsupported", "remote", r.RemoteAddr, "error", err)
+		}
+	}
 	send := func(event string, payload any) bool {
 		b, err := json.Marshal(payload)
 		if err != nil {
 			return false
 		}
+		setDeadline()
 		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b); err != nil {
 			return false
 		}
@@ -641,6 +756,7 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-heartbeat.C:
+			setDeadline()
 			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
 				return
 			}
@@ -666,7 +782,7 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	rev, err := a.store.CatalogRevision(r.Context(), rt.station.UUID)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w, r, "catalog revision failed", err)
 		return
 	}
 	etag := catalogETag(rev, limit, r.URL.Query().Get("cursor"))
@@ -678,7 +794,7 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	}
 	tracks, err := a.store.ListCatalogPage(r.Context(), rt.station.UUID, afterTitle, afterID, limit+1)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w, r, "catalog page failed", err)
 		return
 	}
 	hasMore := len(tracks) > limit
@@ -706,7 +822,7 @@ func (a *app) handleAsset(kind string) http.HandlerFunc {
 		}
 		id := r.PathValue("id")
 		if asset, ok := rt.engine.Asset(id, kind); ok {
-			serveAsset(w, r, asset)
+			a.serveAsset(w, r, asset)
 			return
 		}
 		asset, err := a.store.Asset(r.Context(), rt.station.UUID, id, kind)
@@ -715,11 +831,11 @@ func (a *app) handleAsset(kind string) http.HandlerFunc {
 			return
 		}
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			internalServerError(w, r, "asset lookup failed", err)
 			return
 		}
 		rt.engine.RequestRefresh()
-		serveAsset(w, r, asset)
+		a.serveAsset(w, r, asset)
 	}
 }
 
@@ -735,6 +851,15 @@ func writeJSON(w http.ResponseWriter, v any) {
 	}
 	enc := json.NewEncoder(w)
 	_ = enc.Encode(v)
+}
+
+func internalServerError(w http.ResponseWriter, r *http.Request, msg string, err error) {
+	attrs := []any{"method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr}
+	if err != nil {
+		attrs = append(attrs, "error", err)
+	}
+	slog.Error(msg, attrs...)
+	http.Error(w, "internal server error", http.StatusInternalServerError)
 }
 
 func loadWebFiles() (map[string]webFile, error) {
@@ -760,20 +885,29 @@ func loadWebFiles() (map[string]webFile, error) {
 	return out, nil
 }
 
-func serveAsset(w http.ResponseWriter, r *http.Request, a store.Asset) {
+func (a *app) serveAsset(w http.ResponseWriter, r *http.Request, asset store.Asset) {
+	serveAsset(w, r, asset, filepath.Join(a.cfg.CacheDir, "covers"))
+}
+
+func serveAsset(w http.ResponseWriter, r *http.Request, a store.Asset, coverRoot string) {
+	if err := validateCoverAssetPath(a, coverRoot); err != nil {
+		slog.Warn("rejecting cover asset", "path", a.Path, "mime", a.MIME, "error", err)
+		http.NotFound(w, r)
+		return
+	}
 	f, err := os.Open(a.Path)
 	if errors.Is(err, os.ErrNotExist) {
 		http.NotFound(w, r)
 		return
 	}
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w, r, "asset open failed", err)
 		return
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		internalServerError(w, r, "asset stat failed", err)
 		return
 	}
 	etag := assetETag(a, info)
@@ -785,6 +919,45 @@ func serveAsset(w http.ResponseWriter, r *http.Request, a store.Asset) {
 		return
 	}
 	http.ServeContent(w, r, filepath.Base(a.Path), info.ModTime(), f)
+}
+
+func validateCoverAssetPath(a store.Asset, coverRoot string) error {
+	if a.Kind != "cover" {
+		return fmt.Errorf("unsupported asset kind %q", a.Kind)
+	}
+	ext := strings.ToLower(filepath.Ext(a.Path))
+	if expected := coverMIMEByExt(ext); expected == "" || a.MIME != expected {
+		return fmt.Errorf("cover extension %q does not match mime %q", ext, a.MIME)
+	}
+	rootAbs, err := filepath.Abs(coverRoot)
+	if err != nil {
+		return err
+	}
+	pathAbs, err := filepath.Abs(a.Path)
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("cover path escapes cover root")
+	}
+	return nil
+}
+
+func coverMIMEByExt(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	default:
+		return ""
+	}
 }
 
 func assetETag(a store.Asset, info os.FileInfo) string {

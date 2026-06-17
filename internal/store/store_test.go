@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -327,7 +328,7 @@ func TestMigrationCreatesPerformanceIndexes(t *testing.T) {
 	}
 }
 
-func TestGooseMigrationCreatesFreshSchemaAndRejectsLegacyDatabase(t *testing.T) {
+func TestFreshSchemaCreatesCurrentTablesAndRejectsHistoricalDatabases(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "raydio.sqlite")
@@ -336,13 +337,11 @@ func TestGooseMigrationCreatesFreshSchemaAndRejectsLegacyDatabase(t *testing.T) 
 		t.Fatal(err)
 	}
 	for _, name := range []string{
-		"goose_db_version",
 		"stations",
 		"tracks",
 		"track_assets",
 		"schedule_slots",
 		"catalog_state",
-		"settings",
 	} {
 		var count int
 		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&count); err != nil {
@@ -352,25 +351,43 @@ func TestGooseMigrationCreatesFreshSchemaAndRejectsLegacyDatabase(t *testing.T) 
 			t.Fatalf("table %s count = %d, want 1", name, count)
 		}
 	}
+	for _, name := range []string{"goose_db_version", "settings"} {
+		var count int
+		if err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("historical table %s count = %d, want 0", name, count)
+		}
+	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	legacyPath := filepath.Join(dir, "legacy.sqlite")
-	db, err := sql.Open("sqlite3", sqliteDSN(legacyPath))
-	if err != nil {
-		t.Fatal(err)
+	tests := map[string]string{
+		"goose.sqlite":    `CREATE TABLE goose_db_version(id INTEGER PRIMARY KEY)`,
+		"legacy.sqlite":   `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`,
+		"settings.sqlite": `CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)`,
 	}
-	if _, err := db.ExecContext(ctx, `CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Open(ctx, legacyPath); err == nil {
-		t.Fatal("expected legacy non-goose database to fail")
-	} else if err.Error() != "database has a legacy non-goose schema; remove or recreate the SQLite database before starting this version" {
-		t.Fatalf("legacy error = %q", err)
+	for name, stmt := range tests {
+		t.Run(name, func(t *testing.T) {
+			dbPath := filepath.Join(dir, name)
+			db, err := sql.Open("sqlite3", sqliteDSN(dbPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(ctx, dbPath); err == nil {
+				t.Fatal("expected historical database to fail")
+			} else if !strings.Contains(err.Error(), "remove or recreate") {
+				t.Fatalf("historical error = %q", err)
+			}
+		})
 	}
 }
 

@@ -163,11 +163,10 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	allAssets, err := e.cfg.Store.ListAssets(ctx, e.cfg.StationUUID)
+	assets, err := e.cfg.Store.AssetsByTrackIDs(ctx, ids)
 	if err != nil {
 		return err
 	}
-	assets := assetsByTrack(allAssets)
 	urls := assetURLsByTrack(e.cfg.StationUUID, assets)
 
 	e.stateMu.Lock()
@@ -499,17 +498,6 @@ func hasUnknownTrack(slots []store.Slot, tracks map[string]store.Track) bool {
 	return false
 }
 
-func assetsByTrack(assets []store.Asset) map[string]map[string]store.Asset {
-	out := make(map[string]map[string]store.Asset, len(assets))
-	for _, a := range assets {
-		if out[a.TrackID] == nil {
-			out[a.TrackID] = map[string]store.Asset{}
-		}
-		out[a.TrackID][a.Kind] = a
-	}
-	return out
-}
-
 func assetURLsByTrack(stationUUID string, assets map[string]map[string]store.Asset) map[string]map[string]string {
 	out := make(map[string]map[string]string, len(assets))
 	for trackID, byKind := range assets {
@@ -687,14 +675,6 @@ func (r *audioRing) wait(ctx context.Context, seq int64) (AudioPacket, int64, er
 		case <-notify:
 		}
 	}
-}
-
-func (r *audioRing) len() int {
-	n := r.nextSeq.Load()
-	if n > int64(r.capacity) {
-		return r.capacity
-	}
-	return int(n)
 }
 
 func (r *audioRing) packet(seq, nextSeq int64) (AudioPacket, bool) {
