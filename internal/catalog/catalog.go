@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"mime"
@@ -45,6 +46,11 @@ type ScanResult struct {
 
 type scanCandidate struct {
 	path string
+}
+
+type trackMetadata struct {
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
 }
 
 var mediaSlots = make(chan struct{}, 4)
@@ -171,11 +177,25 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 }
 
 func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo) (bool, error) {
+	metadata, err := readTrackMetadata(path)
+	if err != nil {
+		return false, err
+	}
 	if old, err := s.store.TrackBySource(ctx, s.cfg.StationUUID, path); err == nil && sourceUnchanged(old, info) && existingNonEmpty(old.CachePath) {
+		next := old
+		next.Title = metadata.Title
+		next.Artist = metadata.Artist
+		next.Album = ""
+		changed := trackChanged(old, next)
+		if changed {
+			if err := s.store.UpsertTrack(ctx, next); err != nil {
+				return false, err
+			}
+		}
 		if err := s.syncAssets(ctx, old.ID, path); err != nil {
 			return false, err
 		}
-		return false, nil
+		return changed, nil
 	} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
@@ -222,8 +242,8 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 		SourceSize:    info.Size(),
 		SourceModUnix: info.ModTime().Unix(),
 		CachePath:     cachePath,
-		Title:         strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
-		Artist:        "Unknown artist",
+		Title:         metadata.Title,
+		Artist:        metadata.Artist,
 		Album:         "",
 		DurationMs:    v.DurationMs,
 		FrameCount:    v.FrameCount,
@@ -296,6 +316,36 @@ func (s *Service) markFileError(ctx context.Context, path string, err error) err
 func stationTrackID(stationUUID, contentHash string) string {
 	sum := sha256.Sum256([]byte(stationUUID + "\x00" + contentHash))
 	return hex.EncodeToString(sum[:])
+}
+
+func readTrackMetadata(path string) (trackMetadata, error) {
+	metadata := defaultTrackMetadata(path)
+	sidecar := replaceExt(path, ".json")
+	b, err := os.ReadFile(sidecar)
+	if errors.Is(err, os.ErrNotExist) {
+		return metadata, nil
+	}
+	if err != nil {
+		return trackMetadata{}, err
+	}
+	var raw trackMetadata
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return trackMetadata{}, err
+	}
+	if title := strings.TrimSpace(raw.Title); title != "" {
+		metadata.Title = title
+	}
+	if artist := strings.TrimSpace(raw.Artist); artist != "" {
+		metadata.Artist = artist
+	}
+	return metadata, nil
+}
+
+func defaultTrackMetadata(path string) trackMetadata {
+	return trackMetadata{
+		Title:  strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
+		Artist: "Unknown artist",
+	}
 }
 
 func (s *Service) syncAssets(ctx context.Context, trackID, sourcePath string) error {

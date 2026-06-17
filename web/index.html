@@ -29,6 +29,14 @@
           <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" />
         </label>
       </section>
+      <section class="command" aria-label="Terminal command">
+        <div class="commandHead">
+          <span>Terminal</span>
+          <button id="copyCommand" type="button">Copy</button>
+          <span id="copyStatus" class="copyStatus" aria-live="polite"></span>
+        </div>
+        <code id="streamCommand"></code>
+      </section>
     </main>
     <audio id="audio" preload="none"></audio>
     <script src="/app.js"></script>

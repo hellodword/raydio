@@ -66,7 +66,20 @@ type Result struct {
 }
 
 type Manifest struct {
-	Files map[string][]string `json:"files"`
+	Clips map[string]ManifestClip `json:"clips"`
+}
+
+type ManifestClip struct {
+	ID       string `json:"id"`
+	Audio    string `json:"audio"`
+	Cover    string `json:"cover,omitempty"`
+	Metadata string `json:"metadata"`
+}
+
+type ClipMetadata struct {
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Artist string `json:"artist"`
 }
 
 func NewClient(baseURL string, httpClient *http.Client) *Client {
@@ -153,7 +166,7 @@ func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
 	if err != nil {
 		return result, err
 	}
-	nextManifest := Manifest{Files: map[string][]string{}}
+	nextManifest := Manifest{Clips: map[string]ManifestClip{}}
 	active := map[string]struct{}{}
 	unique := map[string]struct{}{}
 	var mu sync.Mutex
@@ -171,7 +184,7 @@ func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
 		unique[key] = struct{}{}
 		active[key] = struct{}{}
 		g.Go(func() error {
-			files, downloaded, skipped, err := s.syncClip(gctx, radio.InboxDir, key, clip)
+			entry, downloaded, skipped, err := s.syncClip(gctx, radio.InboxDir, key, clip)
 			mu.Lock()
 			defer mu.Unlock()
 			result.Downloaded += downloaded
@@ -179,15 +192,15 @@ func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
 			if err != nil {
 				result.Errors++
 				s.logger.Warn("suno clip sync failed", "radio", radio.Alias, "uuid", radio.UUID, "clip", key, "error", err)
-				if oldFiles := oldManifest.Files[key]; len(oldFiles) > 0 {
-					nextManifest.Files[key] = oldFiles
+				if oldEntry, ok := oldManifest.Clips[key]; ok {
+					nextManifest.Clips[key] = oldEntry
 				}
 				if gctx.Err() != nil {
 					return gctx.Err()
 				}
 				return nil
 			}
-			nextManifest.Files[key] = files
+			nextManifest.Clips[key] = entry
 			return nil
 		})
 	}
@@ -206,20 +219,24 @@ func (s *Syncer) SyncRadio(ctx context.Context, radio Radio) (Result, error) {
 	return result, nil
 }
 
-func (s *Syncer) syncClip(ctx context.Context, dir, key string, clip Clip) ([]string, int, int, error) {
+func (s *Syncer) syncClip(ctx context.Context, dir, key string, clip Clip) (ManifestClip, int, int, error) {
 	if clip.AudioURL == "" {
-		return nil, 0, 0, errors.New("complete clip has no audio_url")
+		return ManifestClip{}, 0, 0, errors.New("complete clip has no audio_url")
 	}
-	files := []string{}
+	entry := ManifestClip{
+		ID:       firstNonEmpty(clip.ID, key),
+		Audio:    key + ".mp3",
+		Metadata: key + ".json",
+	}
 	downloaded := 0
 	skipped := 0
 	if clip.ImageURL != "" {
 		coverExt, wrote, err := downloadWithExt(ctx, s.client.httpClient, s.client.baseURL, clip.ImageURL, filepath.Join(dir, key), true, s.maxCoverBytes, s.retries)
 		if err != nil {
-			return files, downloaded, skipped, err
+			return entry, downloaded, skipped, err
 		}
 		if coverExt != "" {
-			files = append(files, key+coverExt)
+			entry.Cover = key + coverExt
 			if wrote {
 				downloaded++
 			} else {
@@ -227,17 +244,23 @@ func (s *Syncer) syncClip(ctx context.Context, dir, key string, clip Clip) ([]st
 			}
 		}
 	}
-	wrote, err := downloadFile(ctx, s.client.httpClient, s.client.baseURL, clip.AudioURL, filepath.Join(dir, key+".mp3"), false, s.maxAudioBytes, s.retries)
-	files = append(files, key+".mp3")
+	wrote, err := downloadFile(ctx, s.client.httpClient, s.client.baseURL, clip.AudioURL, filepath.Join(dir, entry.Audio), false, s.maxAudioBytes, s.retries)
 	if err != nil {
-		return files, downloaded, skipped, err
+		return entry, downloaded, skipped, err
 	}
 	if wrote {
 		downloaded++
 	} else {
 		skipped++
 	}
-	return files, downloaded, skipped, nil
+	if err := writeClipMetadata(filepath.Join(dir, entry.Metadata), ClipMetadata{
+		ID:     entry.ID,
+		Title:  strings.TrimSpace(clip.Title),
+		Artist: strings.TrimSpace(clip.Handle),
+	}); err != nil {
+		return entry, downloaded, skipped, err
+	}
+	return entry, downloaded, skipped, nil
 }
 
 func setPlaylistHeaders(req *http.Request) {
@@ -299,6 +322,15 @@ func safeName(name string) string {
 		return "clip"
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func downloadWithExt(ctx context.Context, client *http.Client, baseURL, rawURL, base string, skipExisting bool, maxBytes int64, retries int) (string, bool, error) {
@@ -517,7 +549,7 @@ func isAudioContentType(contentType string) bool {
 }
 
 func loadManifest(path string) (Manifest, error) {
-	out := Manifest{Files: map[string][]string{}}
+	out := Manifest{Clips: map[string]ManifestClip{}}
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return out, nil
@@ -526,17 +558,17 @@ func loadManifest(path string) (Manifest, error) {
 		return out, err
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
-		return Manifest{Files: map[string][]string{}}, err
+		return Manifest{Clips: map[string]ManifestClip{}}, err
 	}
-	if out.Files == nil {
-		out.Files = map[string][]string{}
+	if out.Clips == nil {
+		out.Clips = map[string]ManifestClip{}
 	}
 	return out, nil
 }
 
 func saveManifest(path string, manifest Manifest) error {
-	if manifest.Files == nil {
-		manifest.Files = map[string][]string{}
+	if manifest.Clips == nil {
+		manifest.Clips = map[string]ManifestClip{}
 	}
 	b, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -548,11 +580,11 @@ func saveManifest(path string, manifest Manifest) error {
 
 func deleteStale(dir string, manifest Manifest, active map[string]struct{}) (int, error) {
 	deleted := 0
-	for key, files := range manifest.Files {
+	for key, clip := range manifest.Clips {
 		if _, ok := active[key]; ok {
 			continue
 		}
-		for _, name := range files {
+		for _, name := range clip.files() {
 			path, ok := cleanManifestPath(dir, name)
 			if !ok {
 				continue
@@ -568,6 +600,32 @@ func deleteStale(dir string, manifest Manifest, active map[string]struct{}) (int
 		}
 	}
 	return deleted, nil
+}
+
+func (c ManifestClip) files() []string {
+	files := make([]string, 0, 3)
+	if c.Audio != "" {
+		files = append(files, c.Audio)
+	}
+	if c.Cover != "" {
+		files = append(files, c.Cover)
+	}
+	if c.Metadata != "" {
+		files = append(files, c.Metadata)
+	}
+	return files
+}
+
+func writeClipMetadata(path string, metadata ClipMetadata) error {
+	b, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	if old, err := os.ReadFile(path); err == nil && string(old) == string(b) {
+		return nil
+	}
+	return writeFileAtomic(path, b, 0o644)
 }
 
 func cleanManifestPath(dir, name string) (string, bool) {

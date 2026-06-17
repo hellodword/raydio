@@ -2,6 +2,7 @@ package suno
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -81,15 +82,17 @@ func TestSyncRadioDownloadsClipAssetsAndManifest(t *testing.T) {
 	}
 	assertFile(t, filepath.Join(dir, "clip-a.mp3"), "mp3")
 	assertFile(t, filepath.Join(dir, "clip-a.png"), "png")
-	if _, err := os.Stat(filepath.Join(dir, "clip-a.json")); !os.IsNotExist(err) {
-		t.Fatalf("metadata sidecar exists err=%v", err)
+	metadata := readClipMetadata(t, filepath.Join(dir, "clip-a.json"))
+	if metadata.ID != "clip-a" || metadata.Title != "Song A" || metadata.Artist != "Artist A" {
+		t.Fatalf("metadata = %+v", metadata)
 	}
-	manifest, err := os.ReadFile(filepath.Join(dir, manifestFile))
-	if err != nil {
-		t.Fatal(err)
+	manifest := readManifestFile(t, filepath.Join(dir, manifestFile))
+	entry, ok := manifest.Clips["clip-a"]
+	if !ok {
+		t.Fatalf("manifest missing clip-a: %+v", manifest)
 	}
-	if !strings.Contains(string(manifest), "clip-a.mp3") || !strings.Contains(string(manifest), "clip-a.png") || strings.Contains(string(manifest), "clip-a.json") {
-		t.Fatalf("manifest = %s", manifest)
+	if entry.ID != "clip-a" || entry.Audio != "clip-a.mp3" || entry.Cover != "clip-a.png" || entry.Metadata != "clip-a.json" {
+		t.Fatalf("manifest entry = %+v", entry)
 	}
 }
 
@@ -101,11 +104,17 @@ func TestSyncRadioSkipsExistingMP3AndDeletesStaleManifestFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "stale.mp3"), []byte("stale"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "stale.jpg"), []byte("stale-cover"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stale.json"), []byte(`{"id":"stale","title":"Stale","artist":"Gone"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(dir, "manual.mp3"), []byte("manual"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := saveManifest(filepath.Join(dir, manifestFile), Manifest{Files: map[string][]string{
-		"stale": {"stale.mp3"},
+	if err := saveManifest(filepath.Join(dir, manifestFile), Manifest{Clips: map[string]ManifestClip{
+		"stale": {ID: "stale", Audio: "stale.mp3", Cover: "stale.jpg", Metadata: "stale.json"},
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -137,14 +146,24 @@ func TestSyncRadioSkipsExistingMP3AndDeletesStaleManifestFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Skipped != 1 || result.Deleted != 1 || result.Downloaded != 0 {
+	if result.Skipped != 1 || result.Deleted != 3 || result.Downloaded != 0 {
 		t.Fatalf("result = %+v", result)
 	}
 	assertFile(t, filepath.Join(dir, "clip-a.mp3"), "old")
 	if _, err := os.Stat(filepath.Join(dir, "stale.mp3")); !os.IsNotExist(err) {
 		t.Fatalf("stale exists err=%v", err)
 	}
+	if _, err := os.Stat(filepath.Join(dir, "stale.jpg")); !os.IsNotExist(err) {
+		t.Fatalf("stale cover exists err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "stale.json")); !os.IsNotExist(err) {
+		t.Fatalf("stale metadata exists err=%v", err)
+	}
 	assertFile(t, filepath.Join(dir, "manual.mp3"), "manual")
+	metadata := readClipMetadata(t, filepath.Join(dir, "clip-a.json"))
+	if metadata.Title != "Song A" || metadata.Artist != "Artist A" {
+		t.Fatalf("metadata = %+v", metadata)
+	}
 }
 
 func TestSyncRadioRejectsOversizedAudio(t *testing.T) {
@@ -325,4 +344,30 @@ func assertFile(t *testing.T, path, want string) {
 	if string(got) != want {
 		t.Fatalf("%s = %q, want %q", path, got, want)
 	}
+}
+
+func readClipMetadata(t *testing.T, path string) ClipMetadata {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata ClipMetadata
+	if err := json.Unmarshal(b, &metadata); err != nil {
+		t.Fatal(err)
+	}
+	return metadata
+}
+
+func readManifestFile(t *testing.T, path string) Manifest {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(b, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	return manifest
 }

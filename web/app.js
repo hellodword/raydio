@@ -8,6 +8,9 @@ const artist = document.getElementById("artist");
 const statusText = document.getElementById("status");
 const cover = document.getElementById("cover");
 const coverFallback = document.getElementById("coverFallback");
+const streamCommand = document.getElementById("streamCommand");
+const copyCommand = document.getElementById("copyCommand");
+const copyStatus = document.getElementById("copyStatus");
 
 let currentNow = null;
 let stations = [];
@@ -38,6 +41,17 @@ volume.addEventListener("input", () => {
   audio.volume = Number(volume.value);
 });
 
+copyCommand.addEventListener("click", async () => {
+  const command = streamCommand.textContent.trim();
+  if (!command) return;
+  try {
+    await copyText(command);
+    copyStatus.textContent = "copied";
+  } catch (err) {
+    copyStatus.textContent = "copy failed";
+  }
+});
+
 stationSelect.addEventListener("change", () => {
   const station = stations.find((item) => item.alias === stationSelect.value || item.uuid === stationSelect.value);
   if (station) setStation(station);
@@ -46,6 +60,49 @@ stationSelect.addEventListener("change", () => {
 function stationPath() {
   if (!currentStation) return "";
   return `/radio/${encodeURIComponent(currentStation.alias || currentStation.uuid)}`;
+}
+
+function stationURL() {
+  if (!currentStation) return "";
+  return new URL(stationPath(), window.location.href).toString();
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function updateCommand() {
+  const url = stationURL();
+  const command = url ? `curl -sN ${shellQuote(url)} | ffplay -hide_banner -nodisp -f mp3 -` : "";
+  streamCommand.textContent = command;
+  copyCommand.disabled = command === "";
+  copyStatus.textContent = "";
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch (err) {
+      fallbackCopyText(text);
+      return;
+    }
+  }
+  fallbackCopyText(text);
+}
+
+function fallbackCopyText(text) {
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  if (!copied) throw new Error("copy failed");
 }
 
 async function loadStations() {
@@ -98,6 +155,7 @@ function resetTrackState() {
   cover.removeAttribute("src");
   cover.style.display = "none";
   coverFallback.style.display = "grid";
+  updateCommand();
 }
 
 function renderNow(now) {
@@ -137,6 +195,8 @@ function connectEvents() {
     statusText.textContent = "reconnecting";
   });
 }
+
+updateCommand();
 
 loadStations().catch(() => {
   statusText.textContent = "offline";

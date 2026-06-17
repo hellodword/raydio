@@ -16,7 +16,7 @@ import (
 
 const testStationUUID = "00000000-0000-0000-0000-000000000001"
 
-func TestScanUsesFilenameMetadataAndIgnoresSourceSidecars(t *testing.T) {
+func TestScanUsesSidecarMetadataAndIgnoresSourceTags(t *testing.T) {
 	requireFFmpeg(t)
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -83,7 +83,7 @@ func TestScanUsesFilenameMetadataAndIgnoresSourceSidecars(t *testing.T) {
 	if len(tracks) != 1 {
 		t.Fatalf("active tracks = %d, want 1", len(tracks))
 	}
-	if tracks[0].Title != "song" || tracks[0].Artist != "Unknown artist" || tracks[0].Album != "" {
+	if tracks[0].Title != "Side Title" || tracks[0].Artist != "Side Artist" || tracks[0].Album != "" {
 		t.Fatalf("unexpected imported metadata: %+v", tracks[0])
 	}
 	if _, err := audio.ValidateCleanMP3(ctx, tracks[0].CachePath); err != nil {
@@ -95,6 +95,27 @@ func TestScanUsesFilenameMetadataAndIgnoresSourceSidecars(t *testing.T) {
 	}
 	if len(assets) != 0 {
 		t.Fatalf("embedded cover or ignored sidecar produced assets: %+v", assets)
+	}
+
+	if err := os.WriteFile(filepath.Join(inbox, "song.json"), []byte(`{"title":"Updated Title","artist":"Updated Artist"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	third, err := svc.Scan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !third.Changed {
+		t.Fatal("metadata sidecar update should change catalog")
+	}
+	tracks, err = st.ListActiveTracks(ctx, testStationUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracks) != 1 {
+		t.Fatalf("active tracks = %d, want 1", len(tracks))
+	}
+	if tracks[0].Title != "Updated Title" || tracks[0].Artist != "Updated Artist" {
+		t.Fatalf("updated metadata not imported: %+v", tracks[0])
 	}
 
 	if err := copyTestFile(embeddedCover, filepath.Join(inbox, "song.jpg")); err != nil {

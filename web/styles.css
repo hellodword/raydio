@@ -88,6 +88,46 @@ p {
   flex-wrap: wrap;
 }
 
+.command {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+}
+
+.commandHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #d8d0c2;
+}
+
+.commandHead > span:first-child {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.copyStatus {
+  min-height: 20px;
+  color: #82d4bc;
+  font-size: 13px;
+}
+
+#streamCommand {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  padding: 12px 14px;
+  border: 1px solid rgba(246, 241, 232, 0.18);
+  background: #20252a;
+  color: #f6f1e8;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 button {
   min-width: 96px;
   min-height: 42px;
@@ -138,6 +178,10 @@ input[type="range"] {
 
   .coverWrap {
     width: min(78vw, 320px);
+  }
+
+  .commandHead {
+    flex-wrap: wrap;
   }
 
   h1 {

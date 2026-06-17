@@ -37,6 +37,7 @@ from disk.
   - fixed 576-byte MP3 frames
 - Event-driven worker directory scanner with periodic full-scan fallback.
 - Optional Suno playlist sync worker.
+- Sidecar JSON metadata support for track title and artist.
 - Sidecar cover support for `.jpg`, `.jpeg`, `.png`, and `.webp` files.
 - Silence fallback when the catalog is empty.
 
@@ -185,24 +186,26 @@ keeps `worker.rescan_interval` as a full-scan fallback for missed events or
 filesystems without reliable notifications. Hidden paths, `.tmp` files, and
 `.part` files are ignored.
 
-Raydio does not read source MP3 tags, embedded cover art, sidecar JSON metadata,
-or lyric files. Imported track metadata is intentionally simple:
+Raydio does not read source MP3 tags, embedded cover art, or lyric files.
+Imported track metadata comes from same-name JSON sidecars:
 
-- `title`: source filename without extension.
-- `artist`: `Unknown artist`.
+- `title`: sidecar `title`, falling back to source filename without extension.
+- `artist`: sidecar `artist`, falling back to `Unknown artist`.
 - `album`: empty.
 
 Supported sidecar files:
 
 ```text
 song.mp3
+song.json
 song.jpg
 song.jpeg
 song.png
 song.webp
 ```
 
-Only image sidecars are imported, and they are exposed as cover assets.
+JSON sidecars are imported as track metadata. Image sidecars are imported as
+cover assets.
 
 ### Suno Sync
 
@@ -214,9 +217,10 @@ https://studio-api-prod.suno.com/api/playlist/<uuid>
 ```
 
 Only clips with `clip.status == "complete"` are downloaded. For each clip,
-`suno-worker` writes the MP3 and cover image into `<worker.inbox_dir>/<uuid>`.
-It keeps a `.suno-manifest.json` file for internal bookkeeping and removes only
-stale files it previously managed; manual inbox files are not deleted.
+`suno-worker` writes the MP3, cover image, and JSON metadata sidecar into
+`<worker.inbox_dir>/<uuid>`. It keeps a `.suno-manifest.json` file for internal
+bookkeeping and removes only stale files it previously managed; manual inbox
+files are not deleted.
 `raydio-worker` then imports those files through the normal scanner.
 
 ## HTTP Endpoints
