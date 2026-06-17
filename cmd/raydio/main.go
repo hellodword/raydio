@@ -24,20 +24,23 @@ import (
 )
 
 type config struct {
-	ConfigPath       string
-	Addr             string
-	DataDir          string
-	CacheDir         string
-	DBPath           string
-	ScheduleInterval time.Duration
-	GapFrames        int64
-	LogLevel         slog.Level
+	ConfigPath         string
+	Addr               string
+	DataDir            string
+	CacheDir           string
+	DBPath             string
+	ScheduleInterval   time.Duration
+	StreamChunkWindow  time.Duration
+	StreamBufferWindow time.Duration
+	StreamWriteTimeout time.Duration
+	GapFrames          int64
+	LogLevel           slog.Level
 }
 
 type app struct {
-	cfg       config
-	store     *store.Store
-	scheduler *radio.Scheduler
+	cfg    config
+	store  *store.Store
+	engine *radio.Engine
 }
 
 func main() {
@@ -89,14 +92,17 @@ func readConfig(args []string) (config, error) {
 	}
 	layout := paths.New(fileCfg.DataDir, "")
 	return config{
-		ConfigPath:       configPath,
-		Addr:             fileCfg.Server.Addr,
-		DataDir:          layout.DataDir,
-		CacheDir:         layout.CacheDir,
-		DBPath:           layout.DBPath,
-		ScheduleInterval: fileCfg.Server.ScheduleInterval,
-		GapFrames:        fileCfg.GapFrames,
-		LogLevel:         fileCfg.LogLevel,
+		ConfigPath:         configPath,
+		Addr:               fileCfg.Server.Addr,
+		DataDir:            layout.DataDir,
+		CacheDir:           layout.CacheDir,
+		DBPath:             layout.DBPath,
+		ScheduleInterval:   fileCfg.Server.ScheduleInterval,
+		StreamChunkWindow:  fileCfg.Server.StreamChunkWindow,
+		StreamBufferWindow: fileCfg.Server.StreamBufferWindow,
+		StreamWriteTimeout: fileCfg.Server.StreamWriteTimeout,
+		GapFrames:          fileCfg.GapFrames,
+		LogLevel:           fileCfg.LogLevel,
 	}, nil
 }
 
@@ -115,13 +121,23 @@ func run(ctx context.Context, cfg config) error {
 	defer st.Close()
 
 	scheduler := radio.NewScheduler(st, paths.SilencePath(cfg.CacheDir, cfg.GapFrames), cfg.GapFrames)
-	if err := scheduler.Ensure(ctx, time.Now()); err != nil {
+	engine, err := radio.NewEngine(radio.EngineConfig{
+		Scheduler:          scheduler,
+		Store:              st,
+		SilencePath:        paths.SilencePath(cfg.CacheDir, cfg.GapFrames),
+		RefreshInterval:    cfg.ScheduleInterval,
+		StreamChunkWindow:  cfg.StreamChunkWindow,
+		StreamBufferWindow: cfg.StreamBufferWindow,
+	})
+	if err != nil {
 		return err
 	}
-	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "schedule_interval", cfg.ScheduleInterval, "gap_frames", cfg.GapFrames)
+	if err := engine.Start(ctx); err != nil {
+		return err
+	}
+	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
 
-	a := &app{cfg: cfg, store: st, scheduler: scheduler}
-	go a.scheduleLoop(ctx)
+	a := &app{cfg: cfg, store: st, engine: engine}
 
 	mux := http.NewServeMux()
 	a.routes(mux)
@@ -154,6 +170,15 @@ func validateConfig(cfg config) error {
 	if cfg.ScheduleInterval <= 0 {
 		return fmt.Errorf("schedule interval must be positive")
 	}
+	if cfg.StreamChunkWindow <= 0 {
+		return fmt.Errorf("stream chunk window must be positive")
+	}
+	if cfg.StreamBufferWindow <= 0 {
+		return fmt.Errorf("stream buffer window must be positive")
+	}
+	if cfg.StreamWriteTimeout <= 0 {
+		return fmt.Errorf("stream write timeout must be positive")
+	}
 	if cfg.GapFrames <= 0 {
 		return fmt.Errorf("gap frame count must be positive")
 	}
@@ -171,23 +196,6 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /covers/{id}", a.handleAsset("cover"))
 	mux.HandleFunc("GET /lyrics/{id}", a.handleAsset("lyrics"))
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
-}
-
-func (a *app) scheduleLoop(ctx context.Context) {
-	ticker := time.NewTicker(a.cfg.ScheduleInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := a.scheduler.Ensure(ctx, time.Now()); err != nil {
-				slog.Error("schedule maintenance failed", "error", err)
-			} else {
-				slog.Debug("schedule maintenance complete")
-			}
-		}
-	}
 }
 
 func (a *app) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -232,78 +240,37 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	ticker := time.NewTicker(240 * time.Millisecond)
-	defer ticker.Stop()
-
+	seq := a.engine.LiveSeq()
+	deadlineSupported := true
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		chunks, err := a.scheduler.Chunks(ctx, time.Now(), 10)
+		p, next, err := a.engine.WaitPacket(ctx, seq)
 		if err != nil {
-			slog.Error("radio chunks failed", "remote", r.RemoteAddr, "error", err)
 			return
 		}
-		for _, ch := range chunks {
-			if err := writeChunk(ctx, w, ch); err != nil {
-				if ctx.Err() == nil {
-					slog.Debug("radio stream write stopped", "remote", r.RemoteAddr, "error", err)
-				}
-				return
+		seq = next
+		if deadlineSupported {
+			err := setWriteDeadline(w, a.cfg.StreamWriteTimeout)
+			deadlineSupported = err == nil
+			if err != nil {
+				slog.Debug("radio write deadline unsupported", "remote", r.RemoteAddr, "error", err)
 			}
 		}
-		flusher.Flush()
-
-		select {
-		case <-ctx.Done():
+		if _, err := w.Write(p.Data); err != nil {
+			if ctx.Err() == nil {
+				slog.Debug("radio stream write stopped", "remote", r.RemoteAddr, "error", err)
+			}
 			return
-		case <-ticker.C:
 		}
+		flusher.Flush()
 	}
 }
 
-func writeChunk(ctx context.Context, w io.Writer, ch radio.Chunk) error {
-	f, err := os.Open(ch.Path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err := f.Seek(ch.Offset, io.SeekStart); err != nil {
-		return err
-	}
-	limited := io.LimitReader(f, ch.Length)
-	buf := make([]byte, 32*1024)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		n, readErr := limited.Read(buf)
-		if n > 0 {
-			if _, err := w.Write(buf[:n]); err != nil {
-				return err
-			}
-		}
-		if errors.Is(readErr, io.EOF) {
-			return nil
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
+func setWriteDeadline(w http.ResponseWriter, timeout time.Duration) error {
+	return http.NewResponseController(w).SetWriteDeadline(time.Now().Add(timeout))
 }
 
 func (a *app) handleNow(w http.ResponseWriter, r *http.Request) {
-	now, err := a.scheduler.Now(r.Context(), time.Now())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, now)
+	writeJSON(w, a.engine.Now())
 }
 
 func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -319,7 +286,6 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	var lastSlot string
 	send := func(event string, payload any) bool {
 		b, err := json.Marshal(payload)
 		if err != nil {
@@ -331,26 +297,25 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return true
 	}
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	events, unsubscribe := a.engine.SubscribeEvents()
+	defer unsubscribe()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 
+	if !send("now", a.engine.Now()) {
+		return
+	}
 	for {
-		now, err := a.scheduler.Now(ctx, time.Now())
-		if err != nil {
-			return
-		}
-		if now.SlotID != lastSlot {
-			if !send("now", now) {
-				return
-			}
-			lastSlot = now.SlotID
-		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case now, ok := <-events:
+			if !ok {
+				return
+			}
+			if !send("now", now) {
+				return
+			}
 		case <-heartbeat.C:
 			if _, err := io.WriteString(w, ": heartbeat\n\n"); err != nil {
 				return
@@ -361,12 +326,7 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
-	tracks, err := a.store.ListTracks(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	writeJSON(w, map[string]any{"tracks": tracks})
+	writeJSON(w, map[string]any{"tracks": a.engine.Catalog()})
 }
 
 func (a *app) handleAsset(kind string) http.HandlerFunc {

@@ -19,6 +19,9 @@ log_level: WARN
 server:
   addr: ":18080"
   schedule_interval: 250ms
+  stream_chunk_window: 240ms
+  stream_buffer_window: 2s
+  stream_write_timeout: 5s
 
 worker:
   inbox_dir: '/music inbox'
@@ -45,6 +48,15 @@ worker:
 	}
 	if cfg.Server.ScheduleInterval != 250*time.Millisecond {
 		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
+	}
+	if cfg.Server.StreamChunkWindow != 240*time.Millisecond {
+		t.Fatalf("Server.StreamChunkWindow = %s", cfg.Server.StreamChunkWindow)
+	}
+	if cfg.Server.StreamBufferWindow != 2*time.Second {
+		t.Fatalf("Server.StreamBufferWindow = %s", cfg.Server.StreamBufferWindow)
+	}
+	if cfg.Server.StreamWriteTimeout != 5*time.Second {
+		t.Fatalf("Server.StreamWriteTimeout = %s", cfg.Server.StreamWriteTimeout)
 	}
 	if cfg.Worker.InboxDir != "/music inbox" {
 		t.Fatalf("Worker.InboxDir = %q", cfg.Worker.InboxDir)
@@ -76,6 +88,15 @@ server:
 	}
 	if cfg.Server.ScheduleInterval != time.Minute {
 		t.Fatalf("Server.ScheduleInterval = %s", cfg.Server.ScheduleInterval)
+	}
+	if cfg.Server.StreamChunkWindow != 240*time.Millisecond {
+		t.Fatalf("Server.StreamChunkWindow = %s", cfg.Server.StreamChunkWindow)
+	}
+	if cfg.Server.StreamBufferWindow != 2*time.Second {
+		t.Fatalf("Server.StreamBufferWindow = %s", cfg.Server.StreamBufferWindow)
+	}
+	if cfg.Server.StreamWriteTimeout != 5*time.Second {
+		t.Fatalf("Server.StreamWriteTimeout = %s", cfg.Server.StreamWriteTimeout)
 	}
 	if cfg.Worker.RescanInterval != 30*time.Second {
 		t.Fatalf("Worker.RescanInterval = %s", cfg.Worker.RescanInterval)

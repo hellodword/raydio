@@ -21,8 +21,11 @@ type File struct {
 }
 
 type Server struct {
-	Addr             string
-	ScheduleInterval time.Duration
+	Addr               string
+	ScheduleInterval   time.Duration
+	StreamChunkWindow  time.Duration
+	StreamBufferWindow time.Duration
+	StreamWriteTimeout time.Duration
 }
 
 type Worker struct {
@@ -36,8 +39,11 @@ func Defaults() File {
 		GapFrames: 209,
 		LogLevel:  slog.LevelDebug,
 		Server: Server{
-			Addr:             ":8080",
-			ScheduleInterval: time.Minute,
+			Addr:               ":8080",
+			ScheduleInterval:   time.Minute,
+			StreamChunkWindow:  240 * time.Millisecond,
+			StreamBufferWindow: 2 * time.Second,
+			StreamWriteTimeout: 5 * time.Second,
 		},
 		Worker: Worker{
 			RescanInterval: 30 * time.Second,
@@ -201,6 +207,24 @@ func assign(cfg *File, key, value string) error {
 			return fmt.Errorf("server.schedule_interval must be a Go duration")
 		}
 		cfg.Server.ScheduleInterval = d
+	case "server.stream_chunk_window":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("server.stream_chunk_window must be a Go duration")
+		}
+		cfg.Server.StreamChunkWindow = d
+	case "server.stream_buffer_window":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("server.stream_buffer_window must be a Go duration")
+		}
+		cfg.Server.StreamBufferWindow = d
+	case "server.stream_write_timeout":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("server.stream_write_timeout must be a Go duration")
+		}
+		cfg.Server.StreamWriteTimeout = d
 	case "worker.inbox_dir":
 		cfg.Worker.InboxDir = value
 	case "worker.rescan_interval":

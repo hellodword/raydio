@@ -19,8 +19,11 @@ import (
 
 func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	cfg := config{
-		ScheduleInterval: 0,
-		GapFrames:        1,
+		ScheduleInterval:   0,
+		StreamChunkWindow:  time.Millisecond,
+		StreamBufferWindow: time.Second,
+		StreamWriteTimeout: time.Second,
+		GapFrames:          1,
 	}
 	if err := validateConfig(cfg); err == nil {
 		t.Fatal("expected non-positive schedule interval to fail validation")
@@ -36,6 +39,9 @@ log_level: ERROR
 server:
   addr: ":18080"
   schedule_interval: 250ms
+  stream_chunk_window: 240ms
+  stream_buffer_window: 2s
+  stream_write_timeout: 5s
 worker:
   rescan_interval: 2s
 `), 0o644); err != nil {
@@ -61,6 +67,15 @@ worker:
 	if cfg.ScheduleInterval != 250*time.Millisecond {
 		t.Fatalf("ScheduleInterval = %s", cfg.ScheduleInterval)
 	}
+	if cfg.StreamChunkWindow != 240*time.Millisecond {
+		t.Fatalf("StreamChunkWindow = %s", cfg.StreamChunkWindow)
+	}
+	if cfg.StreamBufferWindow != 2*time.Second {
+		t.Fatalf("StreamBufferWindow = %s", cfg.StreamBufferWindow)
+	}
+	if cfg.StreamWriteTimeout != 5*time.Second {
+		t.Fatalf("StreamWriteTimeout = %s", cfg.StreamWriteTimeout)
+	}
 	if cfg.GapFrames != 7 {
 		t.Fatalf("GapFrames = %d", cfg.GapFrames)
 	}
@@ -74,12 +89,15 @@ func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
 	dir := t.TempDir()
 	layout := paths.New(dir, "")
 	err := run(ctx, config{
-		Addr:             "127.0.0.1:0",
-		DataDir:          dir,
-		CacheDir:         layout.CacheDir,
-		DBPath:           layout.DBPath,
-		ScheduleInterval: time.Second,
-		GapFrames:        5,
+		Addr:               "127.0.0.1:0",
+		DataDir:            dir,
+		CacheDir:           layout.CacheDir,
+		DBPath:             layout.DBPath,
+		ScheduleInterval:   time.Second,
+		StreamChunkWindow:  24 * time.Millisecond,
+		StreamBufferWindow: time.Second,
+		StreamWriteTimeout: time.Second,
+		GapFrames:          5,
 	})
 	if err == nil {
 		t.Fatal("expected missing worker-prepared cache to fail startup")
@@ -108,12 +126,15 @@ func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- run(ctx, config{
-			Addr:             "127.0.0.1:0",
-			DataDir:          dir,
-			CacheDir:         layout.CacheDir,
-			DBPath:           layout.DBPath,
-			ScheduleInterval: 5 * time.Millisecond,
-			GapFrames:        5,
+			Addr:               "127.0.0.1:0",
+			DataDir:            dir,
+			CacheDir:           layout.CacheDir,
+			DBPath:             layout.DBPath,
+			ScheduleInterval:   5 * time.Millisecond,
+			StreamChunkWindow:  24 * time.Millisecond,
+			StreamBufferWindow: time.Second,
+			StreamWriteTimeout: time.Second,
+			GapFrames:          5,
 		})
 	}()
 
@@ -129,7 +150,8 @@ func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
 	}
 }
 
-func TestScheduleLoopMaintainsFutureSlots(t *testing.T) {
+func TestEngineStartMaintainsFutureSlots(t *testing.T) {
+	requireFFmpeg(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -139,11 +161,25 @@ func TestScheduleLoopMaintainsFutureSlots(t *testing.T) {
 	}
 	defer st.Close()
 
-	a := &app{
-		cfg:       config{ScheduleInterval: 5 * time.Millisecond},
-		scheduler: radio.NewScheduler(st, "/cache/silence.mp3", 5),
+	silencePath := filepath.Join(t.TempDir(), "silence.mp3")
+	if err := audio.EnsureSilence(ctx, silencePath, 5); err != nil {
+		t.Fatal(err)
 	}
-	go a.scheduleLoop(ctx)
+	scheduler := radio.NewScheduler(st, silencePath, 5)
+	engine, err := radio.NewEngine(radio.EngineConfig{
+		Scheduler:          scheduler,
+		Store:              st,
+		SilencePath:        silencePath,
+		RefreshInterval:    5 * time.Millisecond,
+		StreamChunkWindow:  24 * time.Millisecond,
+		StreamBufferWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	waitFor(t, 500*time.Millisecond, func() bool {
 		slots, err := st.SlotsEndingAfter(ctx, time.Now().UnixMilli())

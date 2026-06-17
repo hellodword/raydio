@@ -24,6 +24,16 @@ server:
   # This uses Go duration syntax, such as 500ms, 15s, 1m, or 1h.
   schedule_interval: 1m
 
+  # Shared audio chunk size produced once by the main service and fanned out to listeners.
+  # 240ms is 10 MP3 frames at 48 kHz.
+  stream_chunk_window: 240ms
+
+  # Per-listener live catch-up window. Slow listeners skip old chunks after this window.
+  stream_buffer_window: 2s
+
+  # Maximum time a listener write may block before the connection is closed.
+  stream_write_timeout: 5s
+
 worker:
   # Source MP3 directory scanned by raydio-worker.
   # Leave empty to use <data_dir>/inbox.

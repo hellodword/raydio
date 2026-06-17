@@ -127,6 +127,9 @@ Supported keys:
 | `log_level` | `DEBUG` | Minimum structured log level for both binaries. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
+| `server.stream_chunk_window` | `240ms` | Shared audio chunk size produced once and fanned out to listeners. |
+| `server.stream_buffer_window` | `2s` | Live catch-up window for slow listeners. |
+| `server.stream_write_timeout` | `5s` | Maximum blocking time for a listener write. |
 | `worker.inbox_dir` | empty | Source MP3 directory. Empty means `<data_dir>/inbox`. |
 | `worker.rescan_interval` | `30s` | Directory rescan interval. |
 
@@ -251,15 +254,16 @@ Raydio stores schedule slots in SQLite. A slot is either a track or silence:
 track A -> silence gap -> track B -> silence gap -> ...
 ```
 
-The scheduler fills future slots ahead of time. A background ticker keeps this
-schedule extended while the process is running, even if there are no active
-listeners. Track order uses a shuffle bag. When more than one track exists,
-Raydio avoids choosing the same track for adjacent track slots.
+The scheduler fills future slots ahead of time. The main service radio engine
+keeps this schedule extended while the process is running, even if there are no
+active listeners. Track order uses a shuffle bag. When more than one track
+exists, Raydio avoids choosing the same track for adjacent track slots.
 
-Request handlers normally read the current slot from SQLite. If the current slot
-is unexpectedly missing, the handler performs one fallback refill and retries.
-This keeps `/radio`, `/api/now`, and `/api/events` robust without reverting to a
-lazy-only scheduling model.
+The radio engine loads schedule and catalog snapshots into memory on a fixed
+background interval. Request handlers read those snapshots instead of querying
+SQLite per listener. If the current slot is unexpectedly missing, only the
+engine performs a fallback refill and refresh; individual listeners never
+trigger schedule work.
 
 When a source file is removed:
 
@@ -293,7 +297,7 @@ wall-clock slot and frame.
 `raydio` owns only:
 
 - HTTP server
-- `/radio` cached-frame streaming
+- one shared `/radio` producer and listener fanout
 - metadata APIs and static assets
 - background schedule maintenance
 
@@ -303,9 +307,15 @@ without throttling active listeners.
 
 ### Streaming
 
-The stream loop sends small windows of MP3 frames. Each tick is aligned to
-server time, so a slow client does not drag the radio timeline backward. If a
-write stalls, the next successful tick resumes from the current global frame.
+The main service has one global stream producer. Every
+`server.stream_chunk_window`, it reads the current MP3 frame range once from
+disk and publishes the immutable bytes into a shared in-memory ring buffer.
+Each `/radio` listener only tracks a sequence cursor into that ring. Adding
+listeners does not add SQLite queries, schedule calculations, or disk reads.
+
+Slow listeners can fall behind by up to `server.stream_buffer_window`. After
+that, they skip old chunks and rejoin the current live stream. A write blocked
+longer than `server.stream_write_timeout` closes the connection.
 
 ## SQLite Storage
 
@@ -381,6 +391,9 @@ log_level: DEBUG
 server:
   addr: "127.0.0.1:18080"
   schedule_interval: 1m
+  stream_chunk_window: 240ms
+  stream_buffer_window: 2s
+  stream_write_timeout: 5s
 worker:
   inbox_dir: ""
   rescan_interval: 30s

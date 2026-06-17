@@ -247,6 +247,24 @@ func (s *Store) Asset(ctx context.Context, trackID, kind string) (Asset, error) 
 	return a, nil
 }
 
+func (s *Store) ListAssets(ctx context.Context) ([]Asset, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT track_id, kind, path, mime FROM track_assets ORDER BY track_id, kind`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Asset
+	for rows.Next() {
+		var a Asset
+		if err := rows.Scan(&a.TrackID, &a.Kind, &a.Path, &a.MIME); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) SetTrackStatus(ctx context.Context, id, status string, errText sql.NullString) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, error=?, updated_at=? WHERE id=?`,
 		status, errText, time.Now().UTC().Format(time.RFC3339Nano), id)
