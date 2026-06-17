@@ -26,6 +26,44 @@ func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	}
 }
 
+func TestReadConfigLoadsServerSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(`
+data_dir: /srv/raydio
+gap_frames: 7
+server:
+  addr: ":18080"
+  schedule_interval: 250ms
+worker:
+  rescan_interval: 2s
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := readConfig([]string{"-config", path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Addr != ":18080" {
+		t.Fatalf("Addr = %q", cfg.Addr)
+	}
+	if cfg.DataDir != "/srv/raydio" {
+		t.Fatalf("DataDir = %q", cfg.DataDir)
+	}
+	if cfg.CacheDir != "/srv/raydio/cache" {
+		t.Fatalf("CacheDir = %q", cfg.CacheDir)
+	}
+	if cfg.DBPath != "/srv/raydio/raydio.sqlite" {
+		t.Fatalf("DBPath = %q", cfg.DBPath)
+	}
+	if cfg.ScheduleInterval != 250*time.Millisecond {
+		t.Fatalf("ScheduleInterval = %s", cfg.ScheduleInterval)
+	}
+	if cfg.GapFrames != 7 {
+		t.Fatalf("GapFrames = %d", cfg.GapFrames)
+	}
+}
+
 func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

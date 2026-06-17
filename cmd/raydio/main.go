@@ -18,6 +18,7 @@ import (
 
 	"raydio/internal/paths"
 	"raydio/internal/radio"
+	"raydio/internal/settings"
 	"raydio/internal/store"
 	"raydio/web"
 )
@@ -38,7 +39,13 @@ type app struct {
 }
 
 func main() {
-	cfg := readConfig()
+	cfg, err := readConfig(os.Args[1:])
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		log.Fatal(err)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -47,17 +54,35 @@ func main() {
 	}
 }
 
-func readConfig() config {
-	var cfg config
-	flag.StringVar(&cfg.Addr, "addr", env("RAYDIO_ADDR", ":8080"), "HTTP listen address")
-	flag.StringVar(&cfg.DataDir, "data", env("RAYDIO_DATA", "./data"), "data directory")
-	flag.DurationVar(&cfg.ScheduleInterval, "schedule", envDuration("RAYDIO_SCHEDULE", time.Minute), "schedule maintenance interval")
-	flag.Int64Var(&cfg.GapFrames, "gap-frames", envInt64("RAYDIO_GAP_FRAMES", 209), "silence gap frame count")
-	flag.Parse()
-	layout := paths.New(cfg.DataDir, "")
-	cfg.CacheDir = layout.CacheDir
-	cfg.DBPath = layout.DBPath
-	return cfg
+func readConfig(args []string) (config, error) {
+	var configPath string
+	fs := flag.NewFlagSet("raydio", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.StringVar(&configPath, "config", "config.yaml", "configuration file path")
+	fs.Usage = func() {
+		fmt.Fprintf(fs.Output(), "Usage: %s [-config path]\n", fs.Name())
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+	if fs.NArg() != 0 {
+		return config{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+
+	fileCfg, err := settings.Load(configPath)
+	if err != nil {
+		return config{}, err
+	}
+	layout := paths.New(fileCfg.DataDir, "")
+	return config{
+		Addr:             fileCfg.Server.Addr,
+		DataDir:          layout.DataDir,
+		CacheDir:         layout.CacheDir,
+		DBPath:           layout.DBPath,
+		ScheduleInterval: fileCfg.Server.ScheduleInterval,
+		GapFrames:        fileCfg.GapFrames,
+	}, nil
 }
 
 func run(ctx context.Context, cfg config) error {
@@ -348,30 +373,4 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
-}
-
-func env(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func envDuration(key string, fallback time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return fallback
-}
-
-func envInt64(key string, fallback int64) int64 {
-	if v := os.Getenv(key); v != "" {
-		var out int64
-		if _, err := fmt.Sscan(v, &out); err == nil {
-			return out
-		}
-	}
-	return fallback
 }

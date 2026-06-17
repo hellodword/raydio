@@ -1,0 +1,30 @@
+# Raydio configuration.
+# Copy this file to config.yaml before starting raydio-worker and raydio.
+#
+# Both processes read the same config file:
+#   CGO_ENABLED=1 go run ./cmd/raydio-worker
+#   CGO_ENABLED=1 go run ./cmd/raydio
+
+# Root data directory. Raydio stores the SQLite database and media cache here.
+data_dir: ./data
+
+# Silence frames inserted between tracks.
+# At 48 kHz MP3, one frame is 24 ms. 209 frames is about 5.016 seconds.
+gap_frames: 209
+
+server:
+  # HTTP listen address for raydio.
+  addr: ":8080"
+
+  # Background schedule maintenance interval.
+  # This uses Go duration syntax, such as 500ms, 15s, 1m, or 1h.
+  schedule_interval: 1m
+
+worker:
+  # Source MP3 directory scanned by raydio-worker.
+  # Leave empty to use <data_dir>/inbox.
+  inbox_dir: ""
+
+  # How often raydio-worker rescans the inbox directory.
+  # This uses Go duration syntax, such as 500ms, 15s, 1m, or 1h.
+  rescan_interval: 30s

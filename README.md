@@ -52,6 +52,12 @@ github.com/mattn/go-sqlite3 v1.14.44
 
 ## Quick Start
 
+Create a local config file:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
 Start the worker in one terminal:
 
 ```bash
@@ -87,39 +93,48 @@ against the same data directory.
 
 ## Command-Line Flags
 
-### Server: `raydio`
+Both binaries intentionally expose only the config path and help flags:
 
-| Flag | Environment variable | Default | Description |
-| --- | --- | --- | --- |
-| `-addr` | `RAYDIO_ADDR` | `:8080` | HTTP listen address. |
-| `-data` | `RAYDIO_DATA` | `./data` | Root data directory. |
-| `-schedule` | `RAYDIO_SCHEDULE` | `1m` | Background schedule maintenance interval. |
-| `-gap-frames` | `RAYDIO_GAP_FRAMES` | `209` | Silence frames inserted between tracks. |
+| Flag | Default | Description |
+| --- | --- | --- |
+| `-config` | `config.yaml` | Configuration file path. |
+| `-h`, `-help` | none | Print help. |
 
-### Worker: `raydio-worker`
-
-| Flag | Environment variable | Default | Description |
-| --- | --- | --- | --- |
-| `-data` | `RAYDIO_DATA` | `./data` | Root data directory. |
-| `-inbox` | `RAYDIO_INBOX` | `<data>/inbox` | Source MP3 directory. |
-| `-rescan` | `RAYDIO_RESCAN` | `30s` | Directory rescan interval. |
-| `-gap-frames` | `RAYDIO_GAP_FRAMES` | `209` | Silence frames inserted between tracks. |
-
-At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
-5.016 seconds.
+All operational settings live in the config file.
 
 Example:
 
 ```bash
-CGO_ENABLED=1 go run ./cmd/raydio-worker \
-  -data /srv/raydio \
-  -rescan 15s
-
-CGO_ENABLED=1 go run ./cmd/raydio \
-  -addr 127.0.0.1:8080 \
-  -data /srv/raydio \
-  -schedule 1m
+CGO_ENABLED=1 go run ./cmd/raydio-worker -config /srv/raydio/config.yaml
+CGO_ENABLED=1 go run ./cmd/raydio -config /srv/raydio/config.yaml
 ```
+
+## Configuration File
+
+`config.yaml` is ignored by Git because it is the local runtime configuration.
+Start from the commented example:
+
+```bash
+cp config.example.yaml config.yaml
+```
+
+Supported keys:
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `data_dir` | `./data` | Root data directory. |
+| `gap_frames` | `209` | Silence frames inserted between tracks. |
+| `server.addr` | `:8080` | HTTP listen address for `raydio`. |
+| `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
+| `worker.inbox_dir` | empty | Source MP3 directory. Empty means `<data_dir>/inbox`. |
+| `worker.rescan_interval` | `30s` | Directory rescan interval. |
+
+At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
+5.016 seconds.
+
+Duration values use Go duration syntax, such as `500ms`, `15s`, `1m`, or `1h`.
+Relative `data_dir` and `worker.inbox_dir` paths are resolved from the directory
+that contains the config file.
 
 ## Input Files and Metadata
 
@@ -350,8 +365,18 @@ Run with sample files:
 ```bash
 mkdir -p /tmp/raydio-demo/data/inbox
 cp tmp/origin/*.mp3 /tmp/raydio-demo/data/inbox/
-CGO_ENABLED=1 go run ./cmd/raydio-worker -data /tmp/raydio-demo/data
-CGO_ENABLED=1 go run ./cmd/raydio -addr 127.0.0.1:18080 -data /tmp/raydio-demo/data
+cat >/tmp/raydio-demo/config.yaml <<'YAML'
+data_dir: data
+gap_frames: 209
+server:
+  addr: "127.0.0.1:18080"
+  schedule_interval: 1m
+worker:
+  inbox_dir: ""
+  rescan_interval: 30s
+YAML
+CGO_ENABLED=1 go run ./cmd/raydio-worker -config /tmp/raydio-demo/config.yaml
+CGO_ENABLED=1 go run ./cmd/raydio -config /tmp/raydio-demo/config.yaml
 ```
 
 Inspect catalog:
