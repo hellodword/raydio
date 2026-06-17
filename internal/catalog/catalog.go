@@ -32,10 +32,11 @@ type Service struct {
 }
 
 type ScanResult struct {
-	Seen      int `json:"seen"`
-	Processed int `json:"processed"`
-	Skipped   int `json:"skipped"`
-	Errors    int `json:"errors"`
+	Seen      int  `json:"seen"`
+	Processed int  `json:"processed"`
+	Skipped   int  `json:"skipped"`
+	Errors    int  `json:"errors"`
+	Changed   bool `json:"changed"`
 }
 
 type Metadata struct {
@@ -104,10 +105,14 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 			return nil
 		}
 		seen[path] = struct{}{}
-		if err := s.processFile(ctx, path, info); err != nil {
+		changed, err := s.processFile(ctx, path, info)
+		if err != nil {
 			result.Errors++
 			_ = s.markFileError(ctx, path, err)
 			return nil
+		}
+		if changed {
+			result.Changed = true
 		}
 		result.Processed++
 		return nil
@@ -115,38 +120,50 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 	if err != nil {
 		return result, err
 	}
-	if err := s.store.MarkMissingExcept(ctx, seen); err != nil {
+	missing, err := s.store.MarkMissingExcept(ctx, seen)
+	if err != nil {
 		return result, err
+	}
+	if len(missing) > 0 {
+		result.Changed = true
+	}
+	if result.Changed {
+		if err := s.store.DeleteFutureSlots(ctx, time.Now().UnixMilli()); err != nil {
+			return result, err
+		}
 	}
 	return result, nil
 }
 
-func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo) error {
+func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo) (bool, error) {
 	sum, err := fileSHA256(path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	id := hex.EncodeToString(sum[:])
 	cachePath := filepath.Join(s.cfg.CacheDir, "tracks", id+".mp3")
+	changed := false
 	if _, err := os.Stat(cachePath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return err
+			return false, err
 		}
 		if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
-			return err
+			return false, err
 		}
+		changed = true
 	} else if _, err := audio.ValidateCleanMP3(ctx, cachePath); err != nil {
 		if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
-			return err
+			return false, err
 		}
+		changed = true
 	}
 	v, err := audio.ValidateCleanMP3(ctx, cachePath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	probe, err := audio.FFprobe(ctx, path)
 	if err != nil {
-		return err
+		return false, err
 	}
 	meta := mergeMetadata(path, audio.TagsFromProbe(probe))
 	if meta.Title == "" {
@@ -174,13 +191,39 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 		Channels:      v.Channels,
 		Status:        store.TrackStatusActive,
 	}
+	if old, err := s.store.Track(ctx, id); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+		changed = true
+	} else if trackChanged(old, t) {
+		changed = true
+	}
 	if err := s.store.UpsertTrack(ctx, t); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.syncAssets(ctx, id, path, probe); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return changed, nil
+}
+
+func trackChanged(old, next store.Track) bool {
+	return old.SourcePath != next.SourcePath ||
+		old.SourceSize != next.SourceSize ||
+		old.SourceModUnix != next.SourceModUnix ||
+		old.CachePath != next.CachePath ||
+		old.Title != next.Title ||
+		old.Artist != next.Artist ||
+		old.Album != next.Album ||
+		old.Comment != next.Comment ||
+		old.DurationMs != next.DurationMs ||
+		old.FrameCount != next.FrameCount ||
+		old.FrameSize != next.FrameSize ||
+		old.Bitrate != next.Bitrate ||
+		old.SampleRate != next.SampleRate ||
+		old.Channels != next.Channels ||
+		old.Status != store.TrackStatusActive
 }
 
 func (s *Service) markFileError(ctx context.Context, path string, err error) error {

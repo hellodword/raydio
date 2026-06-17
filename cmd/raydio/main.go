@@ -142,8 +142,8 @@ func (a *app) scanLoop(ctx context.Context) {
 		case <-ticker.C:
 			if result, err := a.catalog.Scan(ctx); err != nil {
 				log.Printf("scan failed: %v", err)
-			} else if result.Processed > 0 || result.Errors > 0 {
-				log.Printf("scan seen=%d processed=%d skipped=%d errors=%d", result.Seen, result.Processed, result.Skipped, result.Errors)
+			} else if result.Changed || result.Errors > 0 {
+				log.Printf("scan seen=%d processed=%d skipped=%d errors=%d changed=%t", result.Seen, result.Processed, result.Skipped, result.Errors, result.Changed)
 			}
 		}
 	}

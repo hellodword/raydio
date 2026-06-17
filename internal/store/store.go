@@ -253,10 +253,10 @@ func (s *Store) SetTrackStatus(ctx context.Context, id, status string, errText s
 	return err
 }
 
-func (s *Store) MarkMissingExcept(ctx context.Context, seen map[string]struct{}) error {
+func (s *Store) MarkMissingExcept(ctx context.Context, seen map[string]struct{}) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, source_path FROM tracks WHERE status=?`, TrackStatusActive)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -267,21 +267,23 @@ func (s *Store) MarkMissingExcept(ctx context.Context, seen map[string]struct{})
 	for rows.Next() {
 		var r row
 		if err := rows.Scan(&r.id, &r.path); err != nil {
-			return err
+			return nil, err
 		}
 		if _, ok := seen[r.path]; !ok {
 			missing = append(missing, r)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
+	ids := make([]string, 0, len(missing))
 	for _, r := range missing {
 		if err := s.SetTrackStatus(ctx, r.id, TrackStatusMissing, sql.NullString{}); err != nil {
-			return err
+			return nil, err
 		}
+		ids = append(ids, r.id)
 	}
-	return nil
+	return ids, nil
 }
 
 func (s *Store) ListActiveTracks(ctx context.Context) ([]Track, error) {
@@ -347,6 +349,11 @@ func scanTrack(rows interface {
 
 func (s *Store) DeleteSlotsBefore(ctx context.Context, cutoffMs int64) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_slots WHERE end_unix_ms < ?`, cutoffMs)
+	return err
+}
+
+func (s *Store) DeleteFutureSlots(ctx context.Context, cutoffMs int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_slots WHERE start_unix_ms > ?`, cutoffMs)
 	return err
 }
 
