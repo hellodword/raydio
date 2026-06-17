@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const testUUID = "00000000-0000-0000-0000-000000000001"
@@ -42,6 +44,47 @@ func TestClientPlaylistReturnsCompleteClips(t *testing.T) {
 	}
 	if !sawUserAgent {
 		t.Fatal("missing expected user agent")
+	}
+}
+
+func TestClientPlaylistRequestsAreSerialized(t *testing.T) {
+	var active atomic.Int64
+	var maxActive atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		for {
+			old := maxActive.Load()
+			if current <= old || maxActive.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+		active.Add(-1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"playlist_clips":[]}`))
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, srv.Client())
+	errCh := make(chan error, 6)
+	start := make(chan struct{})
+	for i := range cap(errCh) {
+		i := i
+		go func() {
+			<-start
+			_, _, err := client.Playlist(context.Background(), testUUID[:35]+string(rune('1'+i)))
+			errCh <- err
+		}()
+	}
+
+	close(start)
+	for range cap(errCh) {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if maxActive.Load() != 1 {
+		t.Fatalf("max concurrent playlist requests = %d, want 1", maxActive.Load())
 	}
 }
 

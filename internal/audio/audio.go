@@ -26,7 +26,13 @@ const (
 	FrameDurationMs int64 = 24
 )
 
-var silenceOutputLocks sync.Map
+var (
+	silenceOutputLocks sync.Map
+	mediaProcessSlots  = make(chan struct{}, 1)
+	mediaProcessHookMu sync.Mutex
+	mediaProcessStart  func(string)
+	mediaProcessFinish func(string)
+)
 
 type Probe struct {
 	Format struct {
@@ -59,7 +65,7 @@ func FFprobe(ctx context.Context, path string) (Probe, error) {
 	var stderr bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runMediaCommand(ctx, cmd, "ffprobe"); err != nil {
 		return Probe{}, fmt.Errorf("ffprobe %s: %w: %s", path, err, strings.TrimSpace(stderr.String()))
 	}
 	var p Probe
@@ -251,9 +257,15 @@ func validateFrameSizes(ctx context.Context, path string) (int64, error) {
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	release, err := acquireMediaProcess(ctx, "ffprobe")
+	if err != nil {
 		return 0, err
 	}
+	if err := cmd.Start(); err != nil {
+		release()
+		return 0, err
+	}
+	defer release()
 	scanner := bufio.NewScanner(stdout)
 	var count int64
 	for scanner.Scan() {
@@ -314,10 +326,65 @@ func run(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	if err := runMediaCommand(ctx, cmd, name); err != nil {
 		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func runMediaCommand(ctx context.Context, cmd *exec.Cmd, name string) error {
+	release, err := acquireMediaProcess(ctx, name)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return cmd.Run()
+}
+
+func acquireMediaProcess(ctx context.Context, name string) (func(), error) {
+	select {
+	case mediaProcessSlots <- struct{}{}:
+		notifyMediaProcessStart(name)
+		return func() {
+			notifyMediaProcessFinish(name)
+			<-mediaProcessSlots
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func notifyMediaProcessStart(name string) {
+	mediaProcessHookMu.Lock()
+	hook := mediaProcessStart
+	mediaProcessHookMu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
+}
+
+func notifyMediaProcessFinish(name string) {
+	mediaProcessHookMu.Lock()
+	hook := mediaProcessFinish
+	mediaProcessHookMu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
+}
+
+func setMediaProcessHooksForTest(start, finish func(string)) func() {
+	mediaProcessHookMu.Lock()
+	oldStart := mediaProcessStart
+	oldFinish := mediaProcessFinish
+	mediaProcessStart = start
+	mediaProcessFinish = finish
+	mediaProcessHookMu.Unlock()
+	return func() {
+		mediaProcessHookMu.Lock()
+		mediaProcessStart = oldStart
+		mediaProcessFinish = oldFinish
+		mediaProcessHookMu.Unlock()
+	}
 }
 
 func firstNonEmpty(values ...string) string {

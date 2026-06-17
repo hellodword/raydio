@@ -29,8 +29,9 @@ const (
 )
 
 type Client struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL       string
+	httpClient    *http.Client
+	playlistSlots chan struct{}
 }
 
 type Clip struct {
@@ -89,7 +90,7 @@ func NewClient(baseURL string, httpClient *http.Client) *Client {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	return &Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient}
+	return &Client{baseURL: strings.TrimRight(baseURL, "/"), httpClient: httpClient, playlistSlots: make(chan struct{}, 1)}
 }
 
 func (c *Client) Playlist(ctx context.Context, uuid string) ([]Clip, int, error) {
@@ -98,6 +99,11 @@ func (c *Client) Playlist(ctx context.Context, uuid string) ([]Clip, int, error)
 		return nil, 0, err
 	}
 	setPlaylistHeaders(req)
+	release, err := c.acquirePlaylist(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer release()
 	res, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, 0, err
@@ -125,6 +131,15 @@ func (c *Client) Playlist(ctx context.Context, uuid string) ([]Clip, int, error)
 		})
 	}
 	return clips, len(payload.PlaylistClips), nil
+}
+
+func (c *Client) acquirePlaylist(ctx context.Context) (func(), error) {
+	select {
+	case c.playlistSlots <- struct{}{}:
+		return func() { <-c.playlistSlots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func NewSyncer(client *Client, logger *slog.Logger) *Syncer {

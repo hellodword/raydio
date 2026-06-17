@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestEnsureSilenceProducesCleanMP3(t *testing.T) {
@@ -123,6 +125,62 @@ func TestTranscodeCleanMP3ConcurrentSameOutput(t *testing.T) {
 	}
 	if len(matches) != 0 {
 		t.Fatalf("temporary files left behind: %v", matches)
+	}
+}
+
+func TestMediaProcessesAreSerialized(t *testing.T) {
+	requireFFmpeg(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.mp3")
+	if err := exec.CommandContext(ctx, "ffmpeg",
+		"-nostdin", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+		"-c:a", "libmp3lame", "-q:a", "4",
+		"-f", "mp3", src,
+	).Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	var active atomic.Int64
+	var maxActive atomic.Int64
+	restore := setMediaProcessHooksForTest(func(string) {
+		current := active.Add(1)
+		for {
+			old := maxActive.Load()
+			if current <= old || maxActive.CompareAndSwap(old, current) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}, func(string) {
+		active.Add(-1)
+	})
+	defer restore()
+
+	errCh := make(chan error, 6)
+	start := make(chan struct{})
+	for i := range cap(errCh) {
+		i := i
+		go func() {
+			<-start
+			if i%2 == 0 {
+				_, err := FFprobe(ctx, src)
+				errCh <- err
+				return
+			}
+			errCh <- TranscodeCleanMP3(ctx, src, filepath.Join(dir, "clean-"+string(rune('0'+i))+".mp3"))
+		}()
+	}
+
+	close(start)
+	for range cap(errCh) {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if maxActive.Load() != 1 {
+		t.Fatalf("max concurrent media processes = %d, want 1", maxActive.Load())
 	}
 }
 
