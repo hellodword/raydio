@@ -136,7 +136,7 @@ Supported keys:
 | `data_dir` | `./data` | Root data directory. |
 | `gap_frames` | `209` | Silence frames inserted between tracks. |
 | `log_level` | `DEBUG` | Minimum structured log level for all binaries. |
-| `radios[].alias` | none | Human-readable radio path alias. Letters, numbers, spaces, underscores, ampersands, and hyphens only. |
+| `radios[].alias` | none | Human-readable radio path alias. Lowercase letters, numbers, and hyphens only. |
 | `radios[].uuid` | none | Canonical radio UUID. Worker scans `<worker.inbox_dir>/<uuid>`. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |

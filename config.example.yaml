@@ -20,59 +20,59 @@ log_level: DEBUG
 radios:
   # Each configured radio scans <worker.inbox_dir>/<uuid> and streams at
   # /radio/<alias> and /radio/<uuid>.
-  # - alias: K-Pop
+  # - alias: k-pop
   #   uuid: ca1838a1-5fbe-4b47-bd73-f964bf2b5464
-  - alias: Electronic
+  - alias: electronic
     uuid: 37e7cf90-4c91-48d4-8abe-964985438f57
-  # - alias: R&B
+  # - alias: r-and-b
   #   uuid: be0cf4e4-92cb-42cb-a79d-91223fb18a9b
-  # - alias: Rock
+  # - alias: rock
   #   uuid: 5d3c6d9d-3796-4683-b0a9-34368d2644d9
-  # - alias: Gospel
+  # - alias: gospel
   #   uuid: d8fe5bab-da66-4ac4-9fc9-d36b49ebd96c
-  # - alias: Pop
+  # - alias: pop
   #   uuid: bd3f2dc3-f13a-4666-b4b5-6034a8533faa
-  # - alias: Country
+  # - alias: country
   #   uuid: eebc05ec-1509-4526-9030-02e43bb544d3
-  # - alias: Latin
+  # - alias: latin
   #   uuid: cf3315b7-4dcd-4fdd-bd45-8b655c49c10b
-  # - alias: Afrobeats
+  # - alias: afrobeats
   #   uuid: 669182eb-9862-4c69-8420-747641b1c0c0
-  - alias: Shoegaze
+  - alias: shoegaze
     uuid: 0d108340-b925-4a29-8da6-9a57e714be27
-  # - alias: Experimental
+  # - alias: experimental
   #   uuid: 9bebeee9-230d-40f3-aebe-61c217f5105e
-  # - alias: Alternative
+  # - alias: alternative
   #   uuid: 270f8735-807e-47ad-86bd-1d3fc9a2542b
-  # - alias: Folk
+  # - alias: folk
   #   uuid: 61ad1d1c-3c73-4fe8-a8b4-d88a82dbf020
-  - alias: Jazz
+  - alias: jazz
     uuid: 36b4f483-7181-4521-bf78-6328135f3474
-  # - alias: Blues
+  # - alias: blues
   #   uuid: 1b4f681c-3df9-471a-be39-b66c67150727
-  - alias: House
+  - alias: house
     uuid: 1c716574-8091-42c5-a62a-8283bfbeffd9
-  # - alias: Punk
+  # - alias: punk
   #   uuid: 27a5c30e-a173-4e6b-9779-b90cfdba6f1d
-  # - alias: Dance
+  # - alias: dance
   #   uuid: 0311cb38-bdee-4549-9ca5-3060ff918366
-  # - alias: Indie Rock
+  # - alias: indie-rock
   #   uuid: 07d47836-1a26-418e-aabf-838753a1f9ac
-  # - alias: Hip Hop
+  # - alias: hip-hop
   #   uuid: 7a8259af-549e-47f3-874e-6d0f1d76e272
-  # - alias: Reggae
+  # - alias: reggae
   #   uuid: e1113679-e65e-4588-a873-23c4197dee65
-  # - alias: Hyperpop
+  # - alias: hyperpop
   #   uuid: 978da67c-2fc1-49fa-9037-6210e0775584
-  # - alias: Metal
+  # - alias: metal
   #   uuid: 78708cc9-2daa-4231-9016-0520060e491b
-  # - alias: Funk Soul
+  # - alias: funk-soul
   #   uuid: b1ff9815-583c-4115-a03d-1eed59c967f8
-  - alias: Soundtrack
+  - alias: soundtrack
     uuid: 4c3382a7-4d2e-49de-a505-9b63bdf07315
-  - alias: Classical
+  - alias: classical
     uuid: 3c18bc17-103d-4d5d-b0a3-a78413cbd158
-  - alias: Ambient
+  - alias: ambient
     uuid: fbe8a420-3b69-4dff-bb91-0b241f249bb2
 
 server:

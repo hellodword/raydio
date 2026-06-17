@@ -344,7 +344,7 @@ func assignRadio(r *Radio, key, value string) error {
 
 var (
 	uuidPattern  = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
-	aliasPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9 _&-]*[A-Za-z0-9])?$`)
+	aliasPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 )
 
 func validateRadios(cfg *File) error {
@@ -361,7 +361,7 @@ func validateRadios(cfg *File) error {
 			return fmt.Errorf("radio %d alias is required", i+1)
 		}
 		if !aliasPattern.MatchString(r.Alias) {
-			return fmt.Errorf("radio %q alias must use letters, numbers, spaces, underscores, ampersands, and hyphens", r.Alias)
+			return fmt.Errorf("radio %q alias must use lowercase letters, numbers, and hyphens", r.Alias)
 		}
 		if uuidPattern.MatchString(r.Alias) {
 			return fmt.Errorf("radio alias %q must not look like a uuid", r.Alias)

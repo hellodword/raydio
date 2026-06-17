@@ -178,7 +178,7 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 func TestLoadRejectsInvalidRadios(t *testing.T) {
 	tests := []string{
 		`radios:
-  - alias: bad/alias
+  - alias: Monthly
     uuid: "00000000-0000-0000-0000-000000000001"
 `,
 		`radios:
