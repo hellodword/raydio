@@ -1,0 +1,361 @@
+package catalog
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"raydio/internal/audio"
+	"raydio/internal/store"
+)
+
+type Config struct {
+	InboxDir      string
+	CacheDir      string
+	SilenceFrames int64
+	StableDelay   time.Duration
+}
+
+type Service struct {
+	cfg   Config
+	store *store.Store
+}
+
+type ScanResult struct {
+	Seen      int `json:"seen"`
+	Processed int `json:"processed"`
+	Skipped   int `json:"skipped"`
+	Errors    int `json:"errors"`
+}
+
+type Metadata struct {
+	Title   string `json:"title"`
+	Artist  string `json:"artist"`
+	Album   string `json:"album"`
+	Comment string `json:"comment"`
+}
+
+func New(cfg Config, st *store.Store) *Service {
+	if cfg.StableDelay == 0 {
+		cfg.StableDelay = 250 * time.Millisecond
+	}
+	if cfg.SilenceFrames == 0 {
+		cfg.SilenceFrames = 209
+	}
+	return &Service{cfg: cfg, store: st}
+}
+
+func (s *Service) SilencePath() string {
+	return filepath.Join(s.cfg.CacheDir, "silence", fmt.Sprintf("silence-%dframes.mp3", s.cfg.SilenceFrames))
+}
+
+func (s *Service) EnsureDirs(ctx context.Context) error {
+	dirs := []string{
+		s.cfg.InboxDir,
+		filepath.Join(s.cfg.CacheDir, "tracks"),
+		filepath.Join(s.cfg.CacheDir, "covers"),
+		filepath.Join(s.cfg.CacheDir, "lyrics"),
+		filepath.Join(s.cfg.CacheDir, "silence"),
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	return audio.EnsureSilence(ctx, s.SilencePath(), s.cfg.SilenceFrames)
+}
+
+func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
+	if err := s.EnsureDirs(ctx); err != nil {
+		return ScanResult{}, err
+	}
+
+	var result ScanResult
+	seen := map[string]struct{}{}
+	err := filepath.WalkDir(s.cfg.InboxDir, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			result.Errors++
+			return nil
+		}
+		if d.IsDir() {
+			if path != s.cfg.InboxDir && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !isCandidate(path, d.Name()) {
+			result.Skipped++
+			return nil
+		}
+		result.Seen++
+		stable, info, err := stableFile(path, s.cfg.StableDelay)
+		if err != nil || !stable {
+			result.Skipped++
+			return nil
+		}
+		seen[path] = struct{}{}
+		if err := s.processFile(ctx, path, info); err != nil {
+			result.Errors++
+			_ = s.markFileError(ctx, path, err)
+			return nil
+		}
+		result.Processed++
+		return nil
+	})
+	if err != nil {
+		return result, err
+	}
+	if err := s.store.MarkMissingExcept(ctx, seen); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo) error {
+	sum, err := fileSHA256(path)
+	if err != nil {
+		return err
+	}
+	id := hex.EncodeToString(sum[:])
+	cachePath := filepath.Join(s.cfg.CacheDir, "tracks", id+".mp3")
+	if _, err := os.Stat(cachePath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
+			return err
+		}
+	} else if _, err := audio.ValidateCleanMP3(ctx, cachePath); err != nil {
+		if err := audio.TranscodeCleanMP3(ctx, path, cachePath); err != nil {
+			return err
+		}
+	}
+	v, err := audio.ValidateCleanMP3(ctx, cachePath)
+	if err != nil {
+		return err
+	}
+	probe, err := audio.FFprobe(ctx, path)
+	if err != nil {
+		return err
+	}
+	meta := mergeMetadata(path, audio.TagsFromProbe(probe))
+	if meta.Title == "" {
+		meta.Title = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	}
+	if meta.Artist == "" {
+		meta.Artist = "Unknown artist"
+	}
+
+	t := store.Track{
+		ID:            id,
+		SourcePath:    path,
+		SourceSize:    info.Size(),
+		SourceModUnix: info.ModTime().Unix(),
+		CachePath:     cachePath,
+		Title:         meta.Title,
+		Artist:        meta.Artist,
+		Album:         meta.Album,
+		Comment:       meta.Comment,
+		DurationMs:    v.DurationMs,
+		FrameCount:    v.FrameCount,
+		FrameSize:     v.FrameSize,
+		Bitrate:       v.Bitrate,
+		SampleRate:    v.SampleRate,
+		Channels:      v.Channels,
+		Status:        store.TrackStatusActive,
+	}
+	if err := s.store.UpsertTrack(ctx, t); err != nil {
+		return err
+	}
+	if err := s.syncAssets(ctx, id, path, probe); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Service) markFileError(ctx context.Context, path string, err error) error {
+	sum, sumErr := fileSHA256(path)
+	if sumErr != nil {
+		return sumErr
+	}
+	id := hex.EncodeToString(sum[:])
+	return s.store.SetTrackStatus(ctx, id, store.TrackStatusError, sql.NullString{String: err.Error(), Valid: true})
+}
+
+func (s *Service) syncAssets(ctx context.Context, trackID, sourcePath string, probe audio.Probe) error {
+	if lrc := firstExisting(replaceExt(sourcePath, ".lrc")); lrc != "" {
+		dst := filepath.Join(s.cfg.CacheDir, "lyrics", trackID+".lrc")
+		if err := copyFile(lrc, dst); err != nil {
+			return err
+		}
+		if err := s.store.UpsertAsset(ctx, store.Asset{TrackID: trackID, Kind: "lyrics", Path: dst, MIME: "text/plain; charset=utf-8"}); err != nil {
+			return err
+		}
+	} else if err := s.store.DeleteAsset(ctx, trackID, "lyrics"); err != nil {
+		return err
+	}
+
+	cover := firstExisting(
+		replaceExt(sourcePath, ".jpg"),
+		replaceExt(sourcePath, ".jpeg"),
+		replaceExt(sourcePath, ".png"),
+		replaceExt(sourcePath, ".webp"),
+	)
+	if cover != "" {
+		ext := strings.ToLower(filepath.Ext(cover))
+		dst := filepath.Join(s.cfg.CacheDir, "covers", trackID+ext)
+		if err := copyFile(cover, dst); err != nil {
+			return err
+		}
+		if err := s.store.UpsertAsset(ctx, store.Asset{TrackID: trackID, Kind: "cover", Path: dst, MIME: mimeByExt(ext)}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if audio.HasAttachedPicture(probe) {
+		dst := filepath.Join(s.cfg.CacheDir, "covers", trackID+".jpg")
+		if err := audio.ExtractEmbeddedCover(ctx, sourcePath, dst); err == nil {
+			return s.store.UpsertAsset(ctx, store.Asset{TrackID: trackID, Kind: "cover", Path: dst, MIME: "image/jpeg"})
+		}
+	}
+	return s.store.DeleteAsset(ctx, trackID, "cover")
+}
+
+func mergeMetadata(path string, tags audio.Tags) Metadata {
+	meta := Metadata{
+		Title:   tags.Title,
+		Artist:  tags.Artist,
+		Album:   tags.Album,
+		Comment: tags.Comment,
+	}
+	sidecar := replaceExt(path, ".json")
+	b, err := os.ReadFile(sidecar)
+	if err == nil {
+		var sc Metadata
+		if json.Unmarshal(b, &sc) == nil {
+			if strings.TrimSpace(sc.Title) != "" {
+				meta.Title = strings.TrimSpace(sc.Title)
+			}
+			if strings.TrimSpace(sc.Artist) != "" {
+				meta.Artist = strings.TrimSpace(sc.Artist)
+			}
+			if strings.TrimSpace(sc.Album) != "" {
+				meta.Album = strings.TrimSpace(sc.Album)
+			}
+			if strings.TrimSpace(sc.Comment) != "" {
+				meta.Comment = strings.TrimSpace(sc.Comment)
+			}
+		}
+	}
+	return meta
+}
+
+func isCandidate(path, name string) bool {
+	lower := strings.ToLower(name)
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
+	if strings.HasSuffix(lower, ".tmp") || strings.HasSuffix(lower, ".part") {
+		return false
+	}
+	return strings.EqualFold(filepath.Ext(path), ".mp3")
+}
+
+func stableFile(path string, delay time.Duration) (bool, os.FileInfo, error) {
+	info1, err := os.Stat(path)
+	if err != nil {
+		return false, nil, err
+	}
+	time.Sleep(delay)
+	info2, err := os.Stat(path)
+	if err != nil {
+		return false, nil, err
+	}
+	if info1.Size() != info2.Size() || !info1.ModTime().Equal(info2.ModTime()) {
+		return false, info2, nil
+	}
+	return true, info2, nil
+}
+
+func fileSHA256(path string) ([32]byte, error) {
+	var zero [32]byte
+	f, err := os.Open(path)
+	if err != nil {
+		return zero, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return zero, err
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out, nil
+}
+
+func copyFile(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".tmp"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return copyErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return closeErr
+	}
+	return os.Rename(tmp, dst)
+}
+
+func replaceExt(path, ext string) string {
+	return strings.TrimSuffix(path, filepath.Ext(path)) + ext
+}
+
+func firstExisting(paths ...string) string {
+	for _, path := range paths {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func mimeByExt(ext string) string {
+	if m := mime.TypeByExtension(ext); m != "" {
+		return m
+	}
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
+}

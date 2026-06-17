@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Raydio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="player">
+      <section class="coverWrap" aria-label="Cover">
+        <img id="cover" class="cover" alt="" />
+        <div id="coverFallback" class="coverFallback">Raydio</div>
+      </section>
+      <section class="meta">
+        <div id="status" class="status">connecting</div>
+        <h1 id="title">No track</h1>
+        <p id="artist">Unknown artist</p>
+        <p id="lyric" class="lyric"></p>
+      </section>
+      <section class="controls" aria-label="Controls">
+        <button id="play" type="button">Play</button>
+        <button id="pause" type="button">Pause</button>
+        <label class="volume">
+          <span>Volume</span>
+          <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" />
+        </label>
+      </section>
+    </main>
+    <audio id="audio" src="/radio" preload="none"></audio>
+    <script src="/app.js"></script>
+  </body>
+</html>
