@@ -1,4 +1,5 @@
 const audio = document.getElementById("audio");
+const stationSelect = document.getElementById("station");
 const playButton = document.getElementById("play");
 const pauseButton = document.getElementById("pause");
 const volume = document.getElementById("volume");
@@ -15,10 +16,17 @@ let lyricIndex = -1;
 let lyricsTrackID = "";
 let lyricsRequestID = 0;
 let serverOffsetMs = 0;
+let stations = [];
+let currentStation = null;
+let events = null;
 
 audio.volume = Number(volume.value);
 
 playButton.addEventListener("click", async () => {
+  if (!currentStation) {
+    statusText.textContent = "no station";
+    return;
+  }
   try {
     statusText.textContent = "playing";
     await audio.play();
@@ -36,10 +44,71 @@ volume.addEventListener("input", () => {
   audio.volume = Number(volume.value);
 });
 
+stationSelect.addEventListener("change", () => {
+  const station = stations.find((item) => item.alias === stationSelect.value || item.uuid === stationSelect.value);
+  if (station) setStation(station);
+});
+
+function stationPath() {
+  if (!currentStation) return "";
+  return `/radio/${encodeURIComponent(currentStation.alias || currentStation.uuid)}`;
+}
+
+async function loadStations() {
+  const res = await fetch("/api/stations", { cache: "no-store" });
+  if (!res.ok) throw new Error(`stations ${res.status}`);
+  const body = await res.json();
+  stations = Array.isArray(body.stations) ? body.stations : [];
+  stationSelect.replaceChildren(
+    ...stations.map((station) => {
+      const option = document.createElement("option");
+      option.value = station.alias || station.uuid;
+      option.textContent = station.alias || station.uuid;
+      return option;
+    }),
+  );
+  if (stations.length === 0) {
+    statusText.textContent = "no station";
+    return;
+  }
+  setStation(stations[0]);
+}
+
+function setStation(station) {
+  currentStation = station;
+  stationSelect.value = station.alias || station.uuid;
+  if (events) {
+    events.close();
+    events = null;
+  }
+  audio.pause();
+  audio.src = stationPath();
+  resetTrackState();
+  statusText.textContent = "ready";
+  loadNow().catch(() => {
+    statusText.textContent = "offline";
+  });
+  connectEvents();
+}
+
 async function loadNow() {
-  const res = await fetch("/api/now", { cache: "no-store" });
+  const res = await fetch(`${stationPath()}/api/now`, { cache: "no-store" });
   if (!res.ok) throw new Error(`now ${res.status}`);
   renderNow(await res.json());
+}
+
+function resetTrackState() {
+  currentNow = null;
+  lyrics = [];
+  lyricIndex = -1;
+  lyricsTrackID = "";
+  lyricsRequestID++;
+  title.textContent = "No track";
+  artist.textContent = "Unknown artist";
+  lyricText.textContent = "";
+  cover.removeAttribute("src");
+  cover.style.display = "none";
+  coverFallback.style.display = "grid";
 }
 
 function renderNow(now) {
@@ -133,7 +202,7 @@ function updateLyric() {
 }
 
 function connectEvents() {
-  const events = new EventSource("/api/events");
+  events = new EventSource(`${stationPath()}/api/events`);
   events.addEventListener("now", (ev) => renderNow(JSON.parse(ev.data)));
   events.addEventListener("open", () => {
     statusText.textContent = audio.paused ? "ready" : "playing";
@@ -144,7 +213,6 @@ function connectEvents() {
 }
 
 setInterval(updateLyric, 500);
-loadNow().catch(() => {
+loadStations().catch(() => {
   statusText.textContent = "offline";
 });
-connectEvents();

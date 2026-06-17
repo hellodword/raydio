@@ -26,6 +26,10 @@ server:
 worker:
   inbox_dir: '/music inbox'
   rescan_interval: 2s
+
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -64,6 +68,9 @@ worker:
 	if cfg.Worker.RescanInterval != 2*time.Second {
 		t.Fatalf("Worker.RescanInterval = %s", cfg.Worker.RescanInterval)
 	}
+	if len(cfg.Radios) != 1 || cfg.Radios[0].Alias != "monthly" || cfg.Radios[0].UUID != "00000000-0000-0000-0000-000000000001" {
+		t.Fatalf("Radios = %+v", cfg.Radios)
+	}
 }
 
 func TestLoadKeepsDefaultsForOmittedValues(t *testing.T) {
@@ -72,6 +79,9 @@ func TestLoadKeepsDefaultsForOmittedValues(t *testing.T) {
 data_dir: /srv/raydio
 server:
   addr: ":18080"
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +120,9 @@ func TestLoadResolvesRelativePathsFromConfigDirectory(t *testing.T) {
 data_dir: data
 worker:
   inbox_dir: inbox
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -143,5 +156,33 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	}
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected invalid log level to fail")
+	}
+}
+
+func TestLoadRejectsInvalidRadios(t *testing.T) {
+	tests := []string{
+		`radios:
+  - alias: Monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+`,
+		`radios:
+  - alias: monthly
+    uuid: "not-a-uuid"
+`,
+		`radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000002"
+`,
+	}
+	for _, body := range tests {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(path); err == nil {
+			t.Fatalf("expected invalid radios to fail: %s", body)
+		}
 	}
 }

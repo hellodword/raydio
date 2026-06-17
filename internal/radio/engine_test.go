@@ -65,9 +65,11 @@ func TestEngineRefreshSkipsCatalogReloadWhenRevisionUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	track := store.Track{
 		ID:            "abcdef1234567890",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/inbox/a.mp3",
 		CachePath:     "/cache/a.mp3",
 		Title:         "A",
@@ -86,7 +88,8 @@ func TestEngineRefreshSkipsCatalogReloadWhenRevisionUnchanged(t *testing.T) {
 	}
 
 	e, err := NewEngine(EngineConfig{
-		Scheduler:          NewScheduler(st, "/cache/silence.mp3", 5),
+		StationUUID:        testStationUUID,
+		Scheduler:          NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5),
 		Store:              st,
 		SilencePath:        "/cache/silence.mp3",
 		RefreshInterval:    time.Minute,
@@ -139,9 +142,11 @@ func TestEngineRefreshCachesScheduledAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	track := store.Track{
 		ID:            "abcdef1234567890",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/inbox/a.mp3",
 		CachePath:     "/cache/a.mp3",
 		Title:         "A",
@@ -163,7 +168,8 @@ func TestEngineRefreshCachesScheduledAssets(t *testing.T) {
 	}
 
 	e, err := NewEngine(EngineConfig{
-		Scheduler:          NewScheduler(st, "/cache/silence.mp3", 5),
+		StationUUID:        testStationUUID,
+		Scheduler:          NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5),
 		Store:              st,
 		SilencePath:        "/cache/silence.mp3",
 		RefreshInterval:    time.Minute,
@@ -189,9 +195,11 @@ func TestEngineRefreshCachesAssetsOutsideSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	active := store.Track{
 		ID:            "abcdef1234567890",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/inbox/a.mp3",
 		CachePath:     "/cache/a.mp3",
 		Title:         "A",
@@ -222,7 +230,8 @@ func TestEngineRefreshCachesAssetsOutsideSchedule(t *testing.T) {
 	}
 
 	e, err := NewEngine(EngineConfig{
-		Scheduler:          NewScheduler(st, "/cache/silence.mp3", 5),
+		StationUUID:        testStationUUID,
+		Scheduler:          NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5),
 		Store:              st,
 		SilencePath:        "/cache/silence.mp3",
 		RefreshInterval:    time.Minute,

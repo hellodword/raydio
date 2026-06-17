@@ -13,6 +13,8 @@ import (
 	"raydio/internal/store"
 )
 
+const testStationUUID = "00000000-0000-0000-0000-000000000001"
+
 func TestMergeMetadataSidecarOverridesTags(t *testing.T) {
 	dir := t.TempDir()
 	mp3 := filepath.Join(dir, "song.mp3")
@@ -68,8 +70,9 @@ func TestScanIsIdempotentAndUsesSidecar(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
-	svc := New(Config{InboxDir: inbox, CacheDir: cache, SilenceFrames: 5, StableDelay: time.Nanosecond}, st)
+	svc := New(Config{StationUUID: testStationUUID, InboxDir: inbox, CacheDir: cache, SilenceFrames: 5, StableDelay: time.Nanosecond}, st)
 	first, err := svc.Scan(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +87,7 @@ func TestScanIsIdempotentAndUsesSidecar(t *testing.T) {
 	if second.Changed {
 		t.Fatal("second scan without file changes should be idempotent")
 	}
-	tracks, err := st.ListActiveTracks(ctx)
+	tracks, err := st.ListActiveTracks(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,12 +126,13 @@ func TestScanRemovesFutureSlotsForMissingTracks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
-	svc := New(Config{InboxDir: inbox, CacheDir: cache, SilenceFrames: 5, StableDelay: time.Nanosecond}, st)
+	svc := New(Config{StationUUID: testStationUUID, InboxDir: inbox, CacheDir: cache, SilenceFrames: 5, StableDelay: time.Nanosecond}, st)
 	if _, err := svc.Scan(ctx); err != nil {
 		t.Fatal(err)
 	}
-	tracks, err := st.ListActiveTracks(ctx)
+	tracks, err := st.ListActiveTracks(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,6 +142,7 @@ func TestScanRemovesFutureSlotsForMissingTracks(t *testing.T) {
 	start := time.Now().Add(time.Minute).UnixMilli()
 	if err := st.UpsertSlot(ctx, store.Slot{
 		ID:          "future-track",
+		StationUUID: testStationUUID,
 		StartUnixMs: start,
 		EndUnixMs:   start + 2400,
 		TrackID:     sqlNullString(tracks[0].ID),
@@ -156,14 +161,14 @@ func TestScanRemovesFutureSlotsForMissingTracks(t *testing.T) {
 	if !result.Changed {
 		t.Fatal("removing source should change catalog")
 	}
-	active, err := st.ListActiveTracks(ctx)
+	active, err := st.ListActiveTracks(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(active) != 0 {
 		t.Fatalf("active tracks after remove = %d, want 0", len(active))
 	}
-	slots, err := st.SlotsEndingAfter(ctx, time.Now().UnixMilli())
+	slots, err := st.SlotsEndingAfter(ctx, testStationUUID, time.Now().UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,6 +179,13 @@ func TestScanRemovesFutureSlotsForMissingTracks(t *testing.T) {
 
 func sqlNullString(v string) sql.NullString {
 	return sql.NullString{String: v, Valid: true}
+}
+
+func mustUpsertStation(t *testing.T, ctx context.Context, st *store.Store) {
+	t.Helper()
+	if err := st.UpsertStation(ctx, store.Station{UUID: testStationUUID, Alias: "monthly", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func requireFFmpeg(t *testing.T) {

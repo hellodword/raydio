@@ -19,6 +19,10 @@
         <p id="lyric" class="lyric"></p>
       </section>
       <section class="controls" aria-label="Controls">
+        <label class="station">
+          <span>Station</span>
+          <select id="station"></select>
+        </label>
         <button id="play" type="button">Play</button>
         <button id="pause" type="button">Pause</button>
         <label class="volume">
@@ -27,7 +31,7 @@
         </label>
       </section>
     </main>
-    <audio id="audio" src="/radio" preload="none"></audio>
+    <audio id="audio" preload="none"></audio>
     <script src="/app.js"></script>
   </body>
 </html>

@@ -20,6 +20,8 @@ import (
 	"raydio/internal/store"
 )
 
+const testStationUUID = "00000000-0000-0000-0000-000000000001"
+
 func TestValidateConfigRejectsNonPositiveScheduleInterval(t *testing.T) {
 	cfg := config{
 		ScheduleInterval:   0,
@@ -47,6 +49,9 @@ server:
   stream_write_timeout: 5s
 worker:
   rescan_interval: 2s
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +90,9 @@ worker:
 	if cfg.LogLevel != slog.LevelError {
 		t.Fatalf("LogLevel = %s", cfg.LogLevel)
 	}
+	if len(cfg.Radios) != 1 || cfg.Radios[0].Alias != "monthly" || cfg.Radios[0].UUID != testStationUUID {
+		t.Fatalf("Radios = %+v", cfg.Radios)
+	}
 }
 
 func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
@@ -101,6 +109,7 @@ func TestRunRejectsMissingWorkerPreparedCache(t *testing.T) {
 		StreamBufferWindow: time.Second,
 		StreamWriteTimeout: time.Second,
 		GapFrames:          5,
+		Radios:             []radioConfig{{Alias: "monthly", UUID: testStationUUID}},
 	})
 	if err == nil {
 		t.Fatal("expected missing worker-prepared cache to fail startup")
@@ -138,6 +147,7 @@ func TestRunStartsWithWorkerPreparedSilence(t *testing.T) {
 			StreamBufferWindow: time.Second,
 			StreamWriteTimeout: time.Second,
 			GapFrames:          5,
+			Radios:             []radioConfig{{Alias: "monthly", UUID: testStationUUID}},
 		})
 	}()
 
@@ -163,13 +173,15 @@ func TestEngineStartMaintainsFutureSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	silencePath := filepath.Join(t.TempDir(), "silence.mp3")
 	if err := audio.EnsureSilence(ctx, silencePath, 5); err != nil {
 		t.Fatal(err)
 	}
-	scheduler := radio.NewScheduler(st, silencePath, 5)
+	scheduler := radio.NewScheduler(st, testStationUUID, silencePath, 5)
 	engine, err := radio.NewEngine(radio.EngineConfig{
+		StationUUID:        testStationUUID,
 		Scheduler:          scheduler,
 		Store:              st,
 		SilencePath:        silencePath,
@@ -185,7 +197,7 @@ func TestEngineStartMaintainsFutureSlots(t *testing.T) {
 	}
 
 	waitFor(t, 500*time.Millisecond, func() bool {
-		slots, err := st.SlotsEndingAfter(ctx, time.Now().UnixMilli())
+		slots, err := st.SlotsEndingAfter(ctx, testStationUUID, time.Now().UnixMilli())
 		return err == nil && len(slots) > 0
 	})
 }
@@ -197,11 +209,12 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	for _, track := range []store.Track{
-		{ID: "aaa", SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
-		{ID: "bbb", SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
-		{ID: "ccc", SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+		{ID: "aaa", StationUUID: testStationUUID, SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+		{ID: "bbb", StationUUID: testStationUUID, SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+		{ID: "ccc", StationUUID: testStationUUID, SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
 	} {
 		if err := st.UpsertTrack(ctx, track); err != nil {
 			t.Fatal(err)
@@ -211,8 +224,9 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	a := &app{store: st}
-	req := httptest.NewRequest(http.MethodGet, "/api/catalog?limit=2", nil)
+	a := testApp(st)
+	req := httptest.NewRequest(http.MethodGet, "/radio/monthly/api/catalog?limit=2", nil)
+	req.SetPathValue("station", "monthly")
 	rr := httptest.NewRecorder()
 	a.handleCatalog(rr, req)
 	if rr.Code != http.StatusOK {
@@ -233,12 +247,13 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 	if page.Revision == 0 || len(page.Tracks) != 2 || !page.HasMore || page.NextCursor == "" {
 		t.Fatalf("page = %+v", page)
 	}
-	if page.Tracks[1].CoverURL != "/covers/bbb" {
+	if page.Tracks[1].CoverURL != "/radio/"+testStationUUID+"/covers/bbb" {
 		t.Fatalf("cover URL = %q", page.Tracks[1].CoverURL)
 	}
 
 	etag := rr.Header().Get("ETag")
-	req = httptest.NewRequest(http.MethodGet, "/api/catalog?limit=2", nil)
+	req = httptest.NewRequest(http.MethodGet, "/radio/monthly/api/catalog?limit=2", nil)
+	req.SetPathValue("station", "monthly")
 	req.Header.Set("If-None-Match", etag)
 	rr = httptest.NewRecorder()
 	a.handleCatalog(rr, req)
@@ -246,7 +261,8 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 		t.Fatalf("etag status = %d", rr.Code)
 	}
 
-	req = httptest.NewRequest(http.MethodGet, "/api/catalog?limit=2&cursor="+page.NextCursor, nil)
+	req = httptest.NewRequest(http.MethodGet, "/radio/monthly/api/catalog?limit=2&cursor="+page.NextCursor, nil)
+	req.SetPathValue("station", "monthly")
 	rr = httptest.NewRecorder()
 	a.handleCatalog(rr, req)
 	if rr.Code != http.StatusOK {
@@ -261,6 +277,33 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 	}
 	if len(next.Tracks) != 1 || next.Tracks[0].ID != "ccc" || next.HasMore {
 		t.Fatalf("next page = %+v", next)
+	}
+}
+
+func TestRoutesRejectLegacyRadioAndAPIPaths(t *testing.T) {
+	a := testApp(nil)
+	mux := http.NewServeMux()
+	a.routes(mux)
+	for _, path := range []string{"/radio", "/api/now", "/api/events", "/api/catalog"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", path, rr.Code)
+		}
+	}
+}
+
+func TestHandleStationsReturnsConfiguredStations(t *testing.T) {
+	a := testApp(nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/stations", nil)
+	rr := httptest.NewRecorder()
+	a.handleStations(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"alias":"monthly"`) || !strings.Contains(rr.Body.String(), testStationUUID) {
+		t.Fatalf("stations body = %s", rr.Body.String())
 	}
 }
 
@@ -324,6 +367,22 @@ func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met before timeout")
+}
+
+func mustUpsertStation(t *testing.T, ctx context.Context, st *store.Store) {
+	t.Helper()
+	if err := st.UpsertStation(ctx, store.Station{UUID: testStationUUID, Alias: "monthly", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func testApp(st *store.Store) *app {
+	rt := &stationRuntime{station: radioConfig{Alias: "monthly", UUID: testStationUUID}}
+	return &app{
+		store:      st,
+		stations:   map[string]*stationRuntime{"monthly": rt, testStationUUID: rt},
+		stationIDs: []string{testStationUUID},
+	}
 }
 
 func requireFFmpeg(t *testing.T) {

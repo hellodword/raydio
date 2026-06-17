@@ -18,6 +18,7 @@ import (
 )
 
 type EngineConfig struct {
+	StationUUID        string
 	Scheduler          *Scheduler
 	Store              *store.Store
 	SilencePath        string
@@ -79,6 +80,12 @@ func NewEngine(cfg EngineConfig) (*Engine, error) {
 	if cfg.SilencePath == "" {
 		return nil, errors.New("silence path is required")
 	}
+	if cfg.StationUUID == "" {
+		cfg.StationUUID = cfg.Scheduler.stationUUID
+	}
+	if cfg.StationUUID == "" {
+		return nil, errors.New("station uuid is required")
+	}
 	if cfg.RefreshInterval <= 0 {
 		return nil, errors.New("refresh interval must be positive")
 	}
@@ -129,11 +136,11 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err := e.cfg.Scheduler.Ensure(ctx, now); err != nil {
 		return err
 	}
-	slots, err := e.cfg.Store.SlotsEndingAfter(ctx, now.Add(-e.cfg.StreamBufferWindow).UnixMilli())
+	slots, err := e.cfg.Store.SlotsEndingAfter(ctx, e.cfg.StationUUID, now.Add(-e.cfg.StreamBufferWindow).UnixMilli())
 	if err != nil {
 		return err
 	}
-	rev, err := e.cfg.Store.CatalogRevision(ctx)
+	rev, err := e.cfg.Store.CatalogRevision(ctx, e.cfg.StationUUID)
 	if err != nil {
 		return err
 	}
@@ -156,12 +163,12 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	allAssets, err := e.cfg.Store.ListAssets(ctx)
+	allAssets, err := e.cfg.Store.ListAssets(ctx, e.cfg.StationUUID)
 	if err != nil {
 		return err
 	}
 	assets := assetsByTrack(allAssets)
-	urls := assetURLsByTrack(assets)
+	urls := assetURLsByTrack(e.cfg.StationUUID, assets)
 
 	e.stateMu.Lock()
 	e.slots = slots
@@ -504,7 +511,7 @@ func assetsByTrack(assets []store.Asset) map[string]map[string]store.Asset {
 	return out
 }
 
-func assetURLsByTrack(assets map[string]map[string]store.Asset) map[string]map[string]string {
+func assetURLsByTrack(stationUUID string, assets map[string]map[string]store.Asset) map[string]map[string]string {
 	out := make(map[string]map[string]string, len(assets))
 	for trackID, byKind := range assets {
 		for _, a := range byKind {
@@ -513,9 +520,9 @@ func assetURLsByTrack(assets map[string]map[string]store.Asset) map[string]map[s
 			}
 			switch a.Kind {
 			case "cover":
-				out[trackID]["cover"] = "/covers/" + trackID
+				out[trackID]["cover"] = "/radio/" + stationUUID + "/covers/" + trackID
 			case "lyrics":
-				out[trackID]["lyrics"] = "/lyrics/" + trackID
+				out[trackID]["lyrics"] = "/radio/" + stationUUID + "/lyrics/" + trackID
 			}
 		}
 	}

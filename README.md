@@ -1,8 +1,9 @@
 # Raydio
 
-Raydio is a single-instance web radio system written in Go. It turns a directory
-of MP3 files into one shared, always-moving radio timeline. Every listener that
-opens `/radio` hears the same track at the same position, based on server time.
+Raydio is a multi-station web radio system written in Go. It turns configured
+MP3 directories into shared, always-moving radio timelines. Every listener that
+opens the same `/radio/<uuid-or-alias>` path hears the same track at the same
+position, based on server time.
 
 Raydio runs as two processes:
 
@@ -17,11 +18,11 @@ from disk.
 
 ## Features
 
-- Global live radio timeline shared by all listeners.
+- Per-station live radio timeline shared by listeners of that station.
 - Background schedule maintenance, even when nobody is listening.
 - Separate media worker for scanner, ffmpeg, ffprobe, cache validation, and
   asset extraction.
-- Infinite `audio/mpeg` stream at `GET /radio`.
+- Infinite `audio/mpeg` streams at `GET /radio/<uuid-or-alias>`.
 - Browser player at `GET /` with play, pause, volume, current track, cover, and
   lyric display.
 - SQLite catalog and persistent schedule.
@@ -79,7 +80,7 @@ http://localhost:8080/
 Add MP3 files to:
 
 ```text
-./data/inbox
+./data/inbox/<radio-uuid>
 ```
 
 `raydio-worker` scans on startup and then rescans every 30 seconds by default.
@@ -125,12 +126,14 @@ Supported keys:
 | `data_dir` | `./data` | Root data directory. |
 | `gap_frames` | `209` | Silence frames inserted between tracks. |
 | `log_level` | `DEBUG` | Minimum structured log level for both binaries. |
+| `radios[].alias` | none | Human-readable radio path alias. Lowercase letters, numbers, and hyphens only. |
+| `radios[].uuid` | none | Canonical radio UUID. Worker scans `<worker.inbox_dir>/<uuid>`. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.schedule_interval` | `1m` | Background schedule maintenance interval. |
 | `server.stream_chunk_window` | `480ms` | Shared audio chunk size produced once and fanned out to listeners. |
 | `server.stream_buffer_window` | `2s` | Live catch-up window for slow listeners. |
 | `server.stream_write_timeout` | `5s` | Maximum blocking time for a listener write. |
-| `worker.inbox_dir` | empty | Source MP3 directory. Empty means `<data_dir>/inbox`. |
+| `worker.inbox_dir` | empty | Base source MP3 directory. Empty means `<data_dir>/inbox`. |
 | `worker.rescan_interval` | `30s` | Directory rescan interval. |
 
 At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
@@ -138,7 +141,7 @@ At 48 kHz MP3, one frame is 24 ms. The default `209`-frame gap is about
 
 Duration values use Go duration syntax, such as `500ms`, `15s`, `1m`, or `1h`.
 Relative `data_dir` and `worker.inbox_dir` paths are resolved from the directory
-that contains the config file.
+that contains the config file. `radios` must contain at least one entry.
 Log level values are `DEBUG`, `INFO`, `WARN`, or `ERROR`.
 
 ## Logging
@@ -150,8 +153,9 @@ events, and worker scan summaries.
 
 ## Input Files and Metadata
 
-`raydio-worker` processes stable `.mp3` files in the inbox directory. Hidden
-files, `.tmp` files, and `.part` files are ignored.
+`raydio-worker` processes stable `.mp3` files under each configured
+`<worker.inbox_dir>/<uuid>` directory. Hidden files, `.tmp` files, and `.part`
+files are ignored.
 
 Metadata priority:
 
@@ -194,20 +198,24 @@ Lyrics use LRC timestamps, for example:
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Browser player. |
-| `GET /radio` | Infinite MP3 stream. |
-| `GET /api/now` | Current server time, slot, track, elapsed time, and duration. |
-| `GET /api/events` | Server-Sent Events stream for track changes. |
-| `GET /api/catalog` | Paginated current catalog state. |
-| `GET /covers/{trackID}` | Cover asset for a track, when present. |
-| `GET /lyrics/{trackID}` | LRC lyric asset for a track, when present. |
+| `GET /api/stations` | Configured station aliases and UUIDs. |
+| `GET /radio/{uuid-or-alias}` | Infinite MP3 stream for one station. |
+| `GET /radio/{uuid-or-alias}/api/now` | Current server time, slot, track, elapsed time, and duration. |
+| `GET /radio/{uuid-or-alias}/api/events` | Server-Sent Events stream for track changes. |
+| `GET /radio/{uuid-or-alias}/api/catalog` | Paginated current station catalog state. |
+| `GET /radio/{uuid-or-alias}/covers/{trackID}` | Cover asset for a track, when present. |
+| `GET /radio/{uuid-or-alias}/lyrics/{trackID}` | LRC lyric asset for a track, when present. |
 | `GET /healthz` | Plain `ok` health check. |
 
-`/api/catalog` is paginated. Use `limit` to request up to 500 tracks and pass
-the returned `nextCursor` as `cursor` to read the next page. Responses include
-`revision`, `tracks`, `nextCursor`, and `hasMore`, and support `ETag`
-revalidation.
+`/radio/{uuid-or-alias}/api/catalog` is paginated. Use `limit` to request up to
+500 tracks and pass the returned `nextCursor` as `cursor` to read the next page.
+Responses include `revision`, `tracks`, `nextCursor`, and `hasMore`, and support
+`ETag` revalidation.
 
-`/radio` sends:
+The legacy `/radio`, `/api/now`, `/api/events`, and `/api/catalog` paths are not
+registered and return 404.
+
+`/radio/{uuid-or-alias}` sends:
 
 ```http
 Content-Type: audio/mpeg
@@ -253,16 +261,17 @@ byteOffset = frameIndex * 576
 
 ### Scheduler
 
-Raydio stores schedule slots in SQLite. A slot is either a track or silence:
+Raydio stores schedule slots in SQLite. Slots are scoped by station UUID. A slot
+is either a track or silence:
 
 ```text
 track A -> silence gap -> track B -> silence gap -> ...
 ```
 
-The scheduler fills future slots ahead of time. The main service radio engine
-keeps this schedule extended while the process is running, even if there are no
-active listeners. Track order uses a shuffle bag. When more than one track
-exists, Raydio avoids choosing the same track for adjacent track slots.
+Each station scheduler fills future slots ahead of time. The main service radio
+engine keeps these schedules extended while the process is running, even if
+there are no active listeners. Track order uses a shuffle bag. When more than
+one track exists, Raydio avoids choosing the same track for adjacent track slots.
 
 The radio engine loads schedule and catalog snapshots into memory on a fixed
 background interval. Request handlers read those snapshots instead of querying
@@ -277,8 +286,8 @@ When a source file is removed:
 - Future schedule slots are refreshed.
 - Already-playing cached audio can finish.
 
-When the catalog is empty, the scheduler emits silence slots and `/radio`
-continues streaming valid MP3 audio.
+When a station catalog is empty, that scheduler emits silence slots and
+`/radio/<uuid-or-alias>` continues streaming valid MP3 audio.
 
 When all listeners disconnect, no audio is played in the background. Raydio only
 continues maintaining schedule rows. The next listener joins the current
@@ -302,7 +311,7 @@ wall-clock slot and frame.
 `raydio` owns only:
 
 - HTTP server
-- one shared `/radio` producer and listener fanout
+- one shared stream producer and listener fanout per station
 - metadata APIs and static assets
 - background schedule maintenance
 
@@ -312,11 +321,12 @@ without throttling active listeners.
 
 ### Streaming
 
-The main service has one global stream producer. Every
-`server.stream_chunk_window`, it reads the current MP3 frame range once from
-disk and publishes the immutable bytes into a shared in-memory ring buffer.
-Each `/radio` listener only tracks a sequence cursor into that ring. Adding
-listeners does not add SQLite queries, schedule calculations, or disk reads.
+The main service has one stream producer per station. Every
+`server.stream_chunk_window`, each producer reads the current MP3 frame range
+once from disk and publishes the immutable bytes into a shared in-memory ring
+buffer. Each listener only tracks a sequence cursor into that station's ring.
+Adding listeners does not add SQLite queries, schedule calculations, or disk
+reads.
 
 Slow listeners can fall behind by up to `server.stream_buffer_window`. After
 that, they skip old chunks and rejoin the current live stream. A write blocked
@@ -344,25 +354,26 @@ Main tables:
 - `tracks`
 - `track_assets`
 - `schedule_slots`
+- `stations`
 - `settings`
 - `schema_migrations`
 
 ## Playback From Terminal
 
 ```bash
-curl -sN http://localhost:8080/radio | ffplay -hide_banner -nodisp -f mp3 -
+curl -sN http://localhost:8080/radio/monthly | ffplay -hide_banner -nodisp -f mp3 -
 ```
 
 ## Reverse Proxy Notes
 
-If `/radio` is served behind a reverse proxy, response buffering must be
-disabled for that route.
+If `/radio/<uuid-or-alias>` is served behind a reverse proxy, response buffering
+must be disabled for that route.
 
 Nginx example:
 
 ```nginx
-location /radio {
-    proxy_pass http://127.0.0.1:8080/radio;
+location /radio/ {
+    proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
     proxy_buffering off;
     proxy_request_buffering off;
@@ -387,12 +398,15 @@ CGO_ENABLED=1 go vet ./...
 Run with sample files:
 
 ```bash
-mkdir -p /tmp/raydio-demo/data/inbox
-cp tmp/origin/*.mp3 /tmp/raydio-demo/data/inbox/
+mkdir -p /tmp/raydio-demo/data/inbox/00000000-0000-0000-0000-000000000001
+cp tmp/origin/*.mp3 /tmp/raydio-demo/data/inbox/00000000-0000-0000-0000-000000000001/
 cat >/tmp/raydio-demo/config.yaml <<'YAML'
 data_dir: data
 gap_frames: 209
 log_level: DEBUG
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
 server:
   addr: "127.0.0.1:18080"
   schedule_interval: 1m
@@ -410,13 +424,13 @@ CGO_ENABLED=1 go run ./cmd/raydio -config /tmp/raydio-demo/config.yaml
 Inspect catalog:
 
 ```bash
-curl -s http://127.0.0.1:18080/api/catalog
+curl -s http://127.0.0.1:18080/radio/monthly/api/catalog
 ```
 
 Capture a short stream sample:
 
 ```bash
-curl --max-time 3 -sN http://127.0.0.1:18080/radio -o /tmp/raydio-sample.mp3
+curl --max-time 3 -sN http://127.0.0.1:18080/radio/monthly -o /tmp/raydio-sample.mp3
 ffprobe -v error -show_format -show_streams /tmp/raydio-sample.mp3
 ```
 

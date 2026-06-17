@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -23,9 +24,16 @@ type config struct {
 	InboxDir       string
 	CacheDir       string
 	DBPath         string
+	Radios         []radioConfig
 	RescanInterval time.Duration
 	GapFrames      int64
 	LogLevel       slog.Level
+}
+
+type radioConfig struct {
+	Alias    string
+	UUID     string
+	InboxDir string
 }
 
 func main() {
@@ -76,12 +84,21 @@ func readConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	layout := paths.New(fileCfg.DataDir, fileCfg.Worker.InboxDir)
+	radios := make([]radioConfig, 0, len(fileCfg.Radios))
+	for _, r := range fileCfg.Radios {
+		radios = append(radios, radioConfig{
+			Alias:    r.Alias,
+			UUID:     r.UUID,
+			InboxDir: filepath.Join(layout.InboxDir, r.UUID),
+		})
+	}
 	return config{
 		ConfigPath:     configPath,
 		DataDir:        layout.DataDir,
 		InboxDir:       layout.InboxDir,
 		CacheDir:       layout.CacheDir,
 		DBPath:         layout.DBPath,
+		Radios:         radios,
 		RescanInterval: fileCfg.Worker.RescanInterval,
 		GapFrames:      fileCfg.GapFrames,
 		LogLevel:       fileCfg.LogLevel,
@@ -95,22 +112,33 @@ func run(ctx context.Context, cfg config) error {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return err
 	}
-	slog.Info("starting raydio-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "rescan_interval", cfg.RescanInterval, "gap_frames", cfg.GapFrames)
+	slog.Info("starting raydio-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "rescan_interval", cfg.RescanInterval, "gap_frames", cfg.GapFrames)
 	st, err := store.Open(ctx, cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	cat := catalog.New(catalog.Config{
-		InboxDir:      cfg.InboxDir,
-		CacheDir:      cfg.CacheDir,
-		SilenceFrames: cfg.GapFrames,
-	}, st)
-	if err := scan(ctx, cat); err != nil {
+	cats := make([]catalogRuntime, 0, len(cfg.Radios))
+	for _, r := range cfg.Radios {
+		if err := st.UpsertStation(ctx, store.Station{UUID: r.UUID, Alias: r.Alias, Enabled: true}); err != nil {
+			return err
+		}
+		cats = append(cats, catalogRuntime{
+			alias: r.Alias,
+			uuid:  r.UUID,
+			cat: catalog.New(catalog.Config{
+				StationUUID:   r.UUID,
+				InboxDir:      r.InboxDir,
+				CacheDir:      cfg.CacheDir,
+				SilenceFrames: cfg.GapFrames,
+			}, st),
+		})
+	}
+	if err := scanAll(ctx, cats); err != nil {
 		return err
 	}
-	return scanLoop(ctx, cfg.RescanInterval, cat)
+	return scanLoop(ctx, cfg.RescanInterval, cats)
 }
 
 func validateConfig(cfg config) error {
@@ -120,10 +148,19 @@ func validateConfig(cfg config) error {
 	if cfg.GapFrames <= 0 {
 		return fmt.Errorf("gap frame count must be positive")
 	}
+	if len(cfg.Radios) == 0 {
+		return fmt.Errorf("at least one radio is required")
+	}
 	return nil
 }
 
-func scanLoop(ctx context.Context, interval time.Duration, cat *catalog.Service) error {
+type catalogRuntime struct {
+	alias string
+	uuid  string
+	cat   *catalog.Service
+}
+
+func scanLoop(ctx context.Context, interval time.Duration, cats []catalogRuntime) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -132,7 +169,7 @@ func scanLoop(ctx context.Context, interval time.Duration, cat *catalog.Service)
 			return nil
 		case <-ticker.C:
 			slog.Debug("catalog scan tick")
-			if err := scan(ctx, cat); err != nil {
+			if err := scanAll(ctx, cats); err != nil {
 				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 					return nil
 				}
@@ -142,14 +179,25 @@ func scanLoop(ctx context.Context, interval time.Duration, cat *catalog.Service)
 	}
 }
 
-func scan(ctx context.Context, cat *catalog.Service) error {
+func scanAll(ctx context.Context, cats []catalogRuntime) error {
+	for _, cat := range cats {
+		if err := scan(ctx, cat); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func scan(ctx context.Context, cat catalogRuntime) error {
 	start := time.Now()
-	slog.Debug("catalog scan starting")
-	result, err := cat.Scan(ctx)
+	slog.Debug("catalog scan starting", "radio", cat.alias, "uuid", cat.uuid)
+	result, err := cat.cat.Scan(ctx)
 	if err != nil {
 		return err
 	}
 	attrs := []any{
+		"radio", cat.alias,
+		"uuid", cat.uuid,
 		"seen", result.Seen,
 		"processed", result.Processed,
 		"skipped", result.Skipped,

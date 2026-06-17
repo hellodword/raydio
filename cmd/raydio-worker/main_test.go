@@ -13,6 +13,8 @@ import (
 	"raydio/internal/paths"
 )
 
+const testStationUUID = "00000000-0000-0000-0000-000000000001"
+
 func TestValidateConfigRejectsInvalidValues(t *testing.T) {
 	if err := validateConfig(config{RescanInterval: 0, GapFrames: 1}); err == nil {
 		t.Fatal("expected non-positive rescan interval to fail validation")
@@ -34,6 +36,9 @@ server:
 worker:
   inbox_dir: /srv/inbox
   rescan_interval: 2s
+radios:
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
 `), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +68,12 @@ worker:
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("LogLevel = %s", cfg.LogLevel)
 	}
+	if len(cfg.Radios) != 1 || cfg.Radios[0].Alias != "monthly" || cfg.Radios[0].UUID != testStationUUID {
+		t.Fatalf("Radios = %+v", cfg.Radios)
+	}
+	if cfg.Radios[0].InboxDir != filepath.Join("/srv/inbox", testStationUUID) {
+		t.Fatalf("Radio inbox = %q", cfg.Radios[0].InboxDir)
+	}
 }
 
 func TestRunCreatesSilenceAndDatabase(t *testing.T) {
@@ -79,6 +90,7 @@ func TestRunCreatesSilenceAndDatabase(t *testing.T) {
 			InboxDir:       layout.InboxDir,
 			CacheDir:       layout.CacheDir,
 			DBPath:         layout.DBPath,
+			Radios:         []radioConfig{{Alias: "monthly", UUID: testStationUUID, InboxDir: filepath.Join(layout.InboxDir, testStationUUID)}},
 			RescanInterval: 50 * time.Millisecond,
 			GapFrames:      5,
 		})
@@ -111,10 +123,11 @@ func TestWorkerScansMP3IntoCache(t *testing.T) {
 
 	dir := t.TempDir()
 	layout := paths.New(dir, "")
-	if err := os.MkdirAll(layout.InboxDir, 0o755); err != nil {
+	stationInbox := filepath.Join(layout.InboxDir, testStationUUID)
+	if err := os.MkdirAll(stationInbox, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	src := filepath.Join(layout.InboxDir, "song.mp3")
+	src := filepath.Join(stationInbox, "song.mp3")
 	if err := exec.CommandContext(ctx, "ffmpeg",
 		"-nostdin", "-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "sine=frequency=330:duration=1",
@@ -131,6 +144,7 @@ func TestWorkerScansMP3IntoCache(t *testing.T) {
 			InboxDir:       layout.InboxDir,
 			CacheDir:       layout.CacheDir,
 			DBPath:         layout.DBPath,
+			Radios:         []radioConfig{{Alias: "monthly", UUID: testStationUUID, InboxDir: stationInbox}},
 			RescanInterval: 50 * time.Millisecond,
 			GapFrames:      5,
 		})

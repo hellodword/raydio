@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const testStationUUID = "00000000-0000-0000-0000-000000000001"
+
 func TestMigrationAndTrackUpsert(t *testing.T) {
 	ctx := context.Background()
 	st, err := Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
@@ -14,9 +16,11 @@ func TestMigrationAndTrackUpsert(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	first := Track{
 		ID:            "aaa",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/music/song.mp3",
 		CachePath:     "/cache/aaa.mp3",
 		Title:         "Song",
@@ -39,7 +43,7 @@ func TestMigrationAndTrackUpsert(t *testing.T) {
 	if err := st.UpsertTrack(ctx, second); err != nil {
 		t.Fatal(err)
 	}
-	active, err := st.ListActiveTracks(ctx)
+	active, err := st.ListActiveTracks(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,12 +59,13 @@ func TestSlotPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
-	slot := Slot{ID: "1-gap", StartUnixMs: 1000, EndUnixMs: 2000, IsSilence: true, FrameCount: 42}
+	slot := Slot{ID: "1-gap", StationUUID: testStationUUID, StartUnixMs: 1000, EndUnixMs: 2000, IsSilence: true, FrameCount: 42}
 	if err := st.UpsertSlot(ctx, slot); err != nil {
 		t.Fatal(err)
 	}
-	got, err := st.SlotAt(ctx, 1500)
+	got, err := st.SlotAt(ctx, testStationUUID, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,13 +81,15 @@ func TestCatalogRevisionChangesWithTracksAndAssets(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
-	empty, err := st.CatalogRevision(ctx)
+	empty, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	track := Track{
 		ID:            "aaa",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/music/song.mp3",
 		CachePath:     "/cache/aaa.mp3",
 		Title:         "Song",
@@ -99,7 +106,7 @@ func TestCatalogRevisionChangesWithTracksAndAssets(t *testing.T) {
 	if err := st.UpsertTrack(ctx, track); err != nil {
 		t.Fatal(err)
 	}
-	withTrack, err := st.CatalogRevision(ctx)
+	withTrack, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +118,7 @@ func TestCatalogRevisionChangesWithTracksAndAssets(t *testing.T) {
 	if err := st.UpsertAsset(ctx, Asset{TrackID: track.ID, Kind: "cover", Path: "/cache/cover.jpg", MIME: "image/jpeg"}); err != nil {
 		t.Fatal(err)
 	}
-	withAsset, err := st.CatalogRevision(ctx)
+	withAsset, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,9 +134,11 @@ func TestNoopTrackUpsertDoesNotChangeCatalogRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	track := Track{
 		ID:            "aaa",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/music/song.mp3",
 		CachePath:     "/cache/aaa.mp3",
 		Title:         "Song",
@@ -146,14 +155,14 @@ func TestNoopTrackUpsertDoesNotChangeCatalogRevision(t *testing.T) {
 	if err := st.UpsertTrack(ctx, track); err != nil {
 		t.Fatal(err)
 	}
-	first, err := st.CatalogRevision(ctx)
+	first, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpsertTrack(ctx, track); err != nil {
 		t.Fatal(err)
 	}
-	same, err := st.CatalogRevision(ctx)
+	same, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +174,7 @@ func TestNoopTrackUpsertDoesNotChangeCatalogRevision(t *testing.T) {
 	if err := st.UpsertTrack(ctx, track); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := st.CatalogRevision(ctx)
+	changed, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,9 +190,11 @@ func TestNoopAssetUpsertDoesNotChangeCatalogRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	track := Track{
 		ID:            "aaa",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/music/song.mp3",
 		CachePath:     "/cache/aaa.mp3",
 		Title:         "Song",
@@ -204,14 +215,14 @@ func TestNoopAssetUpsertDoesNotChangeCatalogRevision(t *testing.T) {
 	if err := st.UpsertAsset(ctx, asset); err != nil {
 		t.Fatal(err)
 	}
-	first, err := st.CatalogRevision(ctx)
+	first, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := st.UpsertAsset(ctx, asset); err != nil {
 		t.Fatal(err)
 	}
-	same, err := st.CatalogRevision(ctx)
+	same, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +234,7 @@ func TestNoopAssetUpsertDoesNotChangeCatalogRevision(t *testing.T) {
 	if err := st.UpsertAsset(ctx, asset); err != nil {
 		t.Fatal(err)
 	}
-	changed, err := st.CatalogRevision(ctx)
+	changed, err := st.CatalogRevision(ctx, testStationUUID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -239,11 +250,12 @@ func TestListCatalogPageReturnsPublicFieldsAndAssetURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	tracks := []Track{
-		{ID: "ccc", SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
-		{ID: "aaa", SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
-		{ID: "bbb", SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "ccc", StationUUID: testStationUUID, SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "aaa", StationUUID: testStationUUID, SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "bbb", StationUUID: testStationUUID, SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
 	}
 	for _, track := range tracks {
 		if err := st.UpsertTrack(ctx, track); err != nil {
@@ -254,18 +266,18 @@ func TestListCatalogPageReturnsPublicFieldsAndAssetURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := st.ListCatalogPage(ctx, "", "", 2)
+	first, err := st.ListCatalogPage(ctx, testStationUUID, "", "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(first) != 2 || first[0].ID != "aaa" || first[1].ID != "bbb" {
 		t.Fatalf("first page = %+v", first)
 	}
-	if first[1].CoverURL != "/covers/bbb" {
+	if first[1].CoverURL != "/radio/"+testStationUUID+"/covers/bbb" {
 		t.Fatalf("cover URL = %q", first[1].CoverURL)
 	}
 
-	next, err := st.ListCatalogPage(ctx, first[1].Title, first[1].ID, 2)
+	next, err := st.ListCatalogPage(ctx, testStationUUID, first[1].Title, first[1].ID, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,5 +323,12 @@ func TestMigrationCreatesPerformanceIndexes(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("trigger %s count = %d, want 1", name, count)
 		}
+	}
+}
+
+func mustUpsertStation(t *testing.T, ctx context.Context, st *Store) {
+	t.Helper()
+	if err := st.UpsertStation(ctx, Station{UUID: testStationUUID, Alias: "monthly", Enabled: true}); err != nil {
+		t.Fatal(err)
 	}
 }

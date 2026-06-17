@@ -16,6 +16,7 @@ import (
 
 type Scheduler struct {
 	store       *store.Store
+	stationUUID string
 	silencePath string
 	gapFrames   int64
 	fillAhead   time.Duration
@@ -67,9 +68,10 @@ type NowTrack struct {
 	LyricsURL string `json:"lyricsUrl,omitempty"`
 }
 
-func NewScheduler(st *store.Store, silencePath string, gapFrames int64) *Scheduler {
+func NewScheduler(st *store.Store, stationUUID, silencePath string, gapFrames int64) *Scheduler {
 	return &Scheduler{
 		store:       st,
+		stationUUID: stationUUID,
 		silencePath: silencePath,
 		gapFrames:   gapFrames,
 		fillAhead:   30 * time.Minute,
@@ -99,7 +101,7 @@ func (s *Scheduler) PositionOrEnsure(ctx context.Context, now time.Time) (Positi
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Position{}, err
 	}
-	if err := s.store.DeleteFutureSlots(ctx, now.UnixMilli()); err != nil {
+	if err := s.store.DeleteFutureSlots(ctx, s.stationUUID, now.UnixMilli()); err != nil {
 		return Position{}, err
 	}
 	if err := s.ensureLocked(ctx, now); err != nil {
@@ -110,7 +112,7 @@ func (s *Scheduler) PositionOrEnsure(ctx context.Context, now time.Time) (Positi
 
 func (s *Scheduler) positionLocked(ctx context.Context, now time.Time) (Position, error) {
 	nowMs := now.UnixMilli()
-	slot, err := s.store.SlotAt(ctx, nowMs)
+	slot, err := s.store.SlotAt(ctx, s.stationUUID, nowMs)
 	if err != nil {
 		return Position{}, err
 	}
@@ -123,7 +125,7 @@ func (s *Scheduler) positionLocked(ctx context.Context, now time.Time) (Position
 		t, err := s.store.Track(ctx, slot.TrackID.String)
 		if err == nil {
 			pos.Track = &t
-			pos.AssetURLs = assetURLs(ctx, s.store, t.ID)
+			pos.AssetURLs = assetURLs(ctx, s.store, s.stationUUID, t.ID)
 		}
 	}
 	return pos, nil
@@ -195,11 +197,11 @@ func (s *Scheduler) Chunks(ctx context.Context, now time.Time, frames int64) ([]
 
 func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 	cutoff := now.Add(-10 * time.Minute).UnixMilli()
-	if err := s.store.DeleteSlotsBefore(ctx, cutoff); err != nil {
+	if err := s.store.DeleteSlotsBefore(ctx, s.stationUUID, cutoff); err != nil {
 		return err
 	}
 	targetEnd := now.Add(s.fillAhead).UnixMilli()
-	last, err := s.store.LastSlot(ctx)
+	last, err := s.store.LastSlot(ctx, s.stationUUID)
 	if errors.Is(err, sql.ErrNoRows) {
 		last = store.Slot{EndUnixMs: now.UnixMilli()}
 	} else if err != nil {
@@ -223,7 +225,8 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 		}
 		t := s.nextTrack(set)
 		trackSlot := store.Slot{
-			ID:          fmt.Sprintf("%d-%s", start, t.ID[:12]),
+			ID:          fmt.Sprintf("%s-%d-%s", s.stationUUID, start, t.ID[:12]),
+			StationUUID: s.stationUUID,
 			StartUnixMs: start,
 			EndUnixMs:   start + framesToMs(t.FrameCount),
 			TrackID:     sql.NullString{String: t.ID, Valid: true},
@@ -240,14 +243,14 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 }
 
 func (s *Scheduler) activeTrackSet(ctx context.Context) (trackSet, error) {
-	rev, err := s.store.CatalogRevision(ctx)
+	rev, err := s.store.CatalogRevision(ctx, s.stationUUID)
 	if err != nil {
 		return trackSet{}, err
 	}
 	if s.tracksReady && rev == s.catalogRev {
 		return s.tracks, nil
 	}
-	tracks, err := s.store.ListActiveTracks(ctx)
+	tracks, err := s.store.ListActiveTracks(ctx, s.stationUUID)
 	if err != nil {
 		return trackSet{}, err
 	}
@@ -260,7 +263,8 @@ func (s *Scheduler) activeTrackSet(ctx context.Context) (trackSet, error) {
 
 func (s *Scheduler) makeSilenceSlot(startMs int64, frames int64, prefix string) store.Slot {
 	return store.Slot{
-		ID:          fmt.Sprintf("%d-%s", startMs, prefix),
+		ID:          fmt.Sprintf("%s-%d-%s", s.stationUUID, startMs, prefix),
+		StationUUID: s.stationUUID,
 		StartUnixMs: startMs,
 		EndUnixMs:   startMs + framesToMs(frames),
 		IsSilence:   true,
@@ -301,17 +305,17 @@ func (s *Scheduler) nextTrack(set trackSet) store.Track {
 	}
 }
 
-func assetURLs(ctx context.Context, st *store.Store, trackID string) map[string]string {
+func assetURLs(ctx context.Context, st *store.Store, stationUUID, trackID string) map[string]string {
 	assets, err := st.AssetsByTrack(ctx, trackID)
 	if err != nil {
 		return map[string]string{}
 	}
 	out := map[string]string{}
 	if _, ok := assets["cover"]; ok {
-		out["cover"] = "/covers/" + trackID
+		out["cover"] = "/radio/" + stationUUID + "/covers/" + trackID
 	}
 	if _, ok := assets["lyrics"]; ok {
-		out["lyrics"] = "/lyrics/" + trackID
+		out["lyrics"] = "/radio/" + stationUUID + "/lyrics/" + trackID
 	}
 	return out
 }

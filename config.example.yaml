@@ -16,6 +16,14 @@ gap_frames: 209
 # Supported values: DEBUG, INFO, WARN, ERROR.
 log_level: DEBUG
 
+radios:
+  # Each configured radio scans <worker.inbox_dir>/<uuid> and streams at
+  # /radio/<alias> and /radio/<uuid>.
+  - alias: monthly
+    uuid: "00000000-0000-0000-0000-000000000001"
+  - alias: weekly
+    uuid: "00000000-0000-0000-0000-000000000002"
+
 server:
   # HTTP listen address for raydio.
   addr: ":8080"
@@ -35,7 +43,8 @@ server:
   stream_write_timeout: 5s
 
 worker:
-  # Source MP3 directory scanned by raydio-worker.
+  # Base source MP3 directory scanned by raydio-worker.
+  # Each configured radio uses a uuid subdirectory below this path.
   # Leave empty to use <data_dir>/inbox.
   inbox_dir: ""
 

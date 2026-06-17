@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -16,8 +17,14 @@ type File struct {
 	DataDir   string
 	GapFrames int64
 	LogLevel  slog.Level
+	Radios    []Radio
 	Server    Server
 	Worker    Worker
+}
+
+type Radio struct {
+	Alias string
+	UUID  string
 }
 
 type Server struct {
@@ -61,6 +68,9 @@ func Load(path string) (File, error) {
 		return File{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	resolvePaths(filepath.Dir(path), &cfg)
+	if err := validateRadios(&cfg); err != nil {
+		return File{}, fmt.Errorf("parse config %s: %w", path, err)
+	}
 	return cfg, nil
 }
 
@@ -79,6 +89,7 @@ func resolvePath(base, path string) string {
 func parseYAMLSubset(b []byte, cfg *File) error {
 	scanner := bufio.NewScanner(bytes.NewReader(b))
 	section := ""
+	currentRadio := -1
 	for lineNo := 1; scanner.Scan(); lineNo++ {
 		raw := scanner.Text()
 		if lineNo == 1 {
@@ -92,13 +103,66 @@ func parseYAMLSubset(b []byte, cfg *File) error {
 			return fmt.Errorf("line %d: tabs are not supported for indentation", lineNo)
 		}
 		indent := len(raw) - len(strings.TrimLeft(raw, " "))
-		if indent != 0 && indent != 2 {
-			return fmt.Errorf("line %d: expected top-level key or two-space section indentation", lineNo)
+		if indent != 0 && indent != 2 && indent != 4 {
+			return fmt.Errorf("line %d: expected top-level key, two-space section indentation, or radio item indentation", lineNo)
 		}
 
 		line := strings.TrimSpace(stripComment(raw))
 		if line == "" {
 			continue
+		}
+		if section == "radios" && indent == 2 {
+			if !strings.HasPrefix(line, "- ") {
+				return fmt.Errorf("line %d: expected radio list item", lineNo)
+			}
+			item := strings.TrimSpace(strings.TrimPrefix(line, "- "))
+			cfg.Radios = append(cfg.Radios, Radio{})
+			currentRadio = len(cfg.Radios) - 1
+			if item == "" {
+				continue
+			}
+			key, value, ok := strings.Cut(item, ":")
+			if !ok {
+				return fmt.Errorf("line %d: expected key: value", lineNo)
+			}
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return fmt.Errorf("line %d: missing value for %q", lineNo, key)
+			}
+			value, err := unquoteValue(value)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", lineNo, err)
+			}
+			if err := assignRadio(&cfg.Radios[currentRadio], key, value); err != nil {
+				return fmt.Errorf("line %d: %w", lineNo, err)
+			}
+			continue
+		}
+		if section == "radios" && indent == 4 {
+			if currentRadio < 0 {
+				return fmt.Errorf("line %d: radio field has no list item", lineNo)
+			}
+			key, value, ok := strings.Cut(line, ":")
+			if !ok {
+				return fmt.Errorf("line %d: expected key: value", lineNo)
+			}
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			if value == "" {
+				return fmt.Errorf("line %d: missing value for %q", lineNo, key)
+			}
+			value, err := unquoteValue(value)
+			if err != nil {
+				return fmt.Errorf("line %d: %w", lineNo, err)
+			}
+			if err := assignRadio(&cfg.Radios[currentRadio], key, value); err != nil {
+				return fmt.Errorf("line %d: %w", lineNo, err)
+			}
+			continue
+		}
+		if section == "radios" && indent != 0 {
+			return fmt.Errorf("line %d: invalid radios indentation", lineNo)
 		}
 		key, value, ok := strings.Cut(line, ":")
 		if !ok {
@@ -111,17 +175,22 @@ func parseYAMLSubset(b []byte, cfg *File) error {
 		}
 
 		if indent == 0 && value == "" {
-			if key != "server" && key != "worker" {
+			if key != "server" && key != "worker" && key != "radios" {
 				return fmt.Errorf("line %d: unknown section %q", lineNo, key)
 			}
 			section = key
+			currentRadio = -1
 			continue
 		}
 		if indent == 0 {
 			section = ""
+			currentRadio = -1
 		}
 		if indent == 2 && section == "" {
 			return fmt.Errorf("line %d: nested key %q has no section", lineNo, key)
+		}
+		if indent == 4 {
+			return fmt.Errorf("line %d: four-space indentation is only valid in radios", lineNo)
 		}
 		if value == "" {
 			return fmt.Errorf("line %d: missing value for %q", lineNo, key)
@@ -235,6 +304,57 @@ func assign(cfg *File, key, value string) error {
 		cfg.Worker.RescanInterval = d
 	default:
 		return fmt.Errorf("unknown key %q", key)
+	}
+	return nil
+}
+
+func assignRadio(r *Radio, key, value string) error {
+	switch key {
+	case "alias":
+		r.Alias = value
+	case "uuid":
+		r.UUID = value
+	default:
+		return fmt.Errorf("unknown radio key %q", key)
+	}
+	return nil
+}
+
+var (
+	uuidPattern  = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	aliasPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+)
+
+func validateRadios(cfg *File) error {
+	if len(cfg.Radios) == 0 {
+		return fmt.Errorf("at least one radio is required")
+	}
+	aliases := map[string]struct{}{}
+	uuids := map[string]struct{}{}
+	for i := range cfg.Radios {
+		r := &cfg.Radios[i]
+		r.Alias = strings.TrimSpace(r.Alias)
+		r.UUID = strings.ToLower(strings.TrimSpace(r.UUID))
+		if r.Alias == "" {
+			return fmt.Errorf("radio %d alias is required", i+1)
+		}
+		if !aliasPattern.MatchString(r.Alias) {
+			return fmt.Errorf("radio %q alias must use lowercase letters, numbers, and hyphens", r.Alias)
+		}
+		if uuidPattern.MatchString(r.Alias) {
+			return fmt.Errorf("radio alias %q must not look like a uuid", r.Alias)
+		}
+		if !uuidPattern.MatchString(r.UUID) {
+			return fmt.Errorf("radio %q uuid must be a canonical uuid", r.Alias)
+		}
+		if _, ok := aliases[r.Alias]; ok {
+			return fmt.Errorf("duplicate radio alias %q", r.Alias)
+		}
+		if _, ok := uuids[r.UUID]; ok {
+			return fmt.Errorf("duplicate radio uuid %q", r.UUID)
+		}
+		aliases[r.Alias] = struct{}{}
+		uuids[r.UUID] = struct{}{}
 	}
 	return nil
 }

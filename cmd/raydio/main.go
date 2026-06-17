@@ -33,6 +33,7 @@ type config struct {
 	DataDir            string
 	CacheDir           string
 	DBPath             string
+	Radios             []radioConfig
 	ScheduleInterval   time.Duration
 	StreamChunkWindow  time.Duration
 	StreamBufferWindow time.Duration
@@ -42,10 +43,21 @@ type config struct {
 }
 
 type app struct {
-	cfg      config
-	store    *store.Store
-	engine   *radio.Engine
-	webFiles map[string]webFile
+	cfg        config
+	store      *store.Store
+	stations   map[string]*stationRuntime
+	stationIDs []string
+	webFiles   map[string]webFile
+}
+
+type radioConfig struct {
+	Alias string `json:"alias"`
+	UUID  string `json:"uuid"`
+}
+
+type stationRuntime struct {
+	station radioConfig
+	engine  *radio.Engine
 }
 
 type webFile struct {
@@ -111,12 +123,17 @@ func readConfig(args []string) (config, error) {
 		return config{}, err
 	}
 	layout := paths.New(fileCfg.DataDir, "")
+	radios := make([]radioConfig, 0, len(fileCfg.Radios))
+	for _, r := range fileCfg.Radios {
+		radios = append(radios, radioConfig{Alias: r.Alias, UUID: r.UUID})
+	}
 	return config{
 		ConfigPath:         configPath,
 		Addr:               fileCfg.Server.Addr,
 		DataDir:            layout.DataDir,
 		CacheDir:           layout.CacheDir,
 		DBPath:             layout.DBPath,
+		Radios:             radios,
 		ScheduleInterval:   fileCfg.Server.ScheduleInterval,
 		StreamChunkWindow:  fileCfg.Server.StreamChunkWindow,
 		StreamBufferWindow: fileCfg.Server.StreamBufferWindow,
@@ -140,28 +157,40 @@ func run(ctx context.Context, cfg config) error {
 	}
 	defer st.Close()
 
-	scheduler := radio.NewScheduler(st, paths.SilencePath(cfg.CacheDir, cfg.GapFrames), cfg.GapFrames)
-	engine, err := radio.NewEngine(radio.EngineConfig{
-		Scheduler:          scheduler,
-		Store:              st,
-		SilencePath:        paths.SilencePath(cfg.CacheDir, cfg.GapFrames),
-		RefreshInterval:    cfg.ScheduleInterval,
-		StreamChunkWindow:  cfg.StreamChunkWindow,
-		StreamBufferWindow: cfg.StreamBufferWindow,
-	})
-	if err != nil {
-		return err
+	stations := map[string]*stationRuntime{}
+	stationIDs := make([]string, 0, len(cfg.Radios))
+	for _, r := range cfg.Radios {
+		if err := st.UpsertStation(ctx, store.Station{UUID: r.UUID, Alias: r.Alias, Enabled: true}); err != nil {
+			return err
+		}
+		scheduler := radio.NewScheduler(st, r.UUID, paths.SilencePath(cfg.CacheDir, cfg.GapFrames), cfg.GapFrames)
+		engine, err := radio.NewEngine(radio.EngineConfig{
+			StationUUID:        r.UUID,
+			Scheduler:          scheduler,
+			Store:              st,
+			SilencePath:        paths.SilencePath(cfg.CacheDir, cfg.GapFrames),
+			RefreshInterval:    cfg.ScheduleInterval,
+			StreamChunkWindow:  cfg.StreamChunkWindow,
+			StreamBufferWindow: cfg.StreamBufferWindow,
+		})
+		if err != nil {
+			return err
+		}
+		if err := engine.Start(ctx); err != nil {
+			return err
+		}
+		rt := &stationRuntime{station: r, engine: engine}
+		stations[r.UUID] = rt
+		stations[r.Alias] = rt
+		stationIDs = append(stationIDs, r.UUID)
 	}
-	if err := engine.Start(ctx); err != nil {
-		return err
-	}
-	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
+	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
 
 	webFiles, err := loadWebFiles()
 	if err != nil {
 		return err
 	}
-	a := &app{cfg: cfg, store: st, engine: engine, webFiles: webFiles}
+	a := &app{cfg: cfg, store: st, stations: stations, stationIDs: stationIDs, webFiles: webFiles}
 
 	mux := http.NewServeMux()
 	a.routes(mux)
@@ -218,6 +247,9 @@ func validateConfig(cfg config) error {
 	if cfg.GapFrames <= 0 {
 		return fmt.Errorf("gap frame count must be positive")
 	}
+	if len(cfg.Radios) == 0 {
+		return fmt.Errorf("at least one radio is required")
+	}
 	return nil
 }
 
@@ -225,12 +257,13 @@ func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", a.handleIndex)
 	mux.HandleFunc("GET /app.js", a.static("app.js", "application/javascript; charset=utf-8"))
 	mux.HandleFunc("GET /styles.css", a.static("styles.css", "text/css; charset=utf-8"))
-	mux.HandleFunc("GET /radio", a.handleRadio)
-	mux.HandleFunc("GET /api/now", a.handleNow)
-	mux.HandleFunc("GET /api/events", a.handleEvents)
-	mux.HandleFunc("GET /api/catalog", a.handleCatalog)
-	mux.HandleFunc("GET /covers/{id}", a.handleAsset("cover"))
-	mux.HandleFunc("GET /lyrics/{id}", a.handleAsset("lyrics"))
+	mux.HandleFunc("GET /api/stations", a.handleStations)
+	mux.HandleFunc("GET /radio/{station}", a.handleRadio)
+	mux.HandleFunc("GET /radio/{station}/api/now", a.handleNow)
+	mux.HandleFunc("GET /radio/{station}/api/events", a.handleEvents)
+	mux.HandleFunc("GET /radio/{station}/api/catalog", a.handleCatalog)
+	mux.HandleFunc("GET /radio/{station}/covers/{id}", a.handleAsset("cover"))
+	mux.HandleFunc("GET /radio/{station}/lyrics/{id}", a.handleAsset("lyrics"))
 	mux.HandleFunc("GET /healthz", a.handleHealthz)
 }
 
@@ -263,7 +296,33 @@ func (a *app) serveWebFile(w http.ResponseWriter, r *http.Request, name, content
 	http.ServeContent(w, r, name, f.ModTime, bytes.NewReader(f.Data))
 }
 
+func (a *app) station(w http.ResponseWriter, r *http.Request) (*stationRuntime, bool) {
+	id := r.PathValue("station")
+	rt, ok := a.stations[id]
+	if !ok {
+		http.NotFound(w, r)
+		return nil, false
+	}
+	return rt, true
+}
+
+func (a *app) handleStations(w http.ResponseWriter, r *http.Request) {
+	out := make([]radioConfig, 0, len(a.stationIDs))
+	for _, id := range a.stationIDs {
+		rt := a.stations[id]
+		if rt == nil {
+			continue
+		}
+		out = append(out, rt.station)
+	}
+	writeJSON(w, map[string]any{"stations": out})
+}
+
 func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
+	rt, ok := a.station(w, r)
+	if !ok {
+		return
+	}
 	slog.Debug("radio stream connected", "remote", r.RemoteAddr)
 	defer slog.Debug("radio stream disconnected", "remote", r.RemoteAddr)
 
@@ -280,10 +339,10 @@ func (a *app) handleRadio(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	seq := a.engine.LiveSeq()
+	seq := rt.engine.LiveSeq()
 	deadlineSupported := true
 	for {
-		p, next, err := a.engine.WaitPacket(ctx, seq)
+		p, next, err := rt.engine.WaitPacket(ctx, seq)
 		if err != nil {
 			return
 		}
@@ -310,10 +369,18 @@ func setWriteDeadline(w http.ResponseWriter, timeout time.Duration) error {
 }
 
 func (a *app) handleNow(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, a.engine.Now())
+	rt, ok := a.station(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, rt.engine.Now())
 }
 
 func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
+	rt, ok := a.station(w, r)
+	if !ok {
+		return
+	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-store, no-transform")
@@ -337,12 +404,12 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return true
 	}
-	events, unsubscribe := a.engine.SubscribeEvents()
+	events, unsubscribe := rt.engine.SubscribeEvents()
 	defer unsubscribe()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
 
-	if !send("now", a.engine.Now()) {
+	if !send("now", rt.engine.Now()) {
 		return
 	}
 	for {
@@ -366,6 +433,10 @@ func (a *app) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
+	rt, ok := a.station(w, r)
+	if !ok {
+		return
+	}
 	limit, err := parseCatalogLimit(r.URL.Query().Get("limit"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -376,7 +447,7 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rev, err := a.store.CatalogRevision(r.Context())
+	rev, err := a.store.CatalogRevision(r.Context(), rt.station.UUID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -388,7 +459,7 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	tracks, err := a.store.ListCatalogPage(r.Context(), afterTitle, afterID, limit+1)
+	tracks, err := a.store.ListCatalogPage(r.Context(), rt.station.UUID, afterTitle, afterID, limit+1)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -412,12 +483,16 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 
 func (a *app) handleAsset(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		rt, ok := a.station(w, r)
+		if !ok {
+			return
+		}
 		id := r.PathValue("id")
-		if asset, ok := a.engine.Asset(id, kind); ok {
+		if asset, ok := rt.engine.Asset(id, kind); ok {
 			serveAsset(w, r, asset)
 			return
 		}
-		asset, err := a.store.Asset(r.Context(), id, kind)
+		asset, err := a.store.Asset(r.Context(), rt.station.UUID, id, kind)
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
@@ -426,7 +501,7 @@ func (a *app) handleAsset(kind string) http.HandlerFunc {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		a.engine.RequestRefresh()
+		rt.engine.RequestRefresh()
 		serveAsset(w, r, asset)
 	}
 }

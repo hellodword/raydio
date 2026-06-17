@@ -27,6 +27,14 @@ type CatalogRevision struct {
 	UpdatedAt string
 }
 
+type Station struct {
+	UUID      string    `json:"uuid"`
+	Alias     string    `json:"alias"`
+	Enabled   bool      `json:"enabled"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 type CatalogTrack struct {
 	ID         string `json:"id"`
 	Title      string `json:"title"`
@@ -39,6 +47,8 @@ type CatalogTrack struct {
 
 type Track struct {
 	ID            string         `json:"id"`
+	StationUUID   string         `json:"stationUuid"`
+	ContentHash   string         `json:"contentHash"`
 	SourcePath    string         `json:"sourcePath"`
 	SourceSize    int64          `json:"sourceSize"`
 	SourceModUnix int64          `json:"sourceModUnix"`
@@ -68,6 +78,7 @@ type Asset struct {
 
 type Slot struct {
 	ID          string         `json:"id"`
+	StationUUID string         `json:"stationUuid"`
 	StartUnixMs int64          `json:"startUnixMs"`
 	EndUnixMs   int64          `json:"endUnixMs"`
 	TrackID     sql.NullString `json:"trackId"`
@@ -133,8 +144,17 @@ func (s *Store) Migrate(ctx context.Context) error {
 			version INTEGER PRIMARY KEY,
 			applied_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS stations (
+			uuid TEXT PRIMARY KEY,
+			alias TEXT NOT NULL UNIQUE,
+			enabled INTEGER NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS tracks (
 			id TEXT PRIMARY KEY,
+			station_uuid TEXT NOT NULL,
+			content_hash TEXT NOT NULL,
 			source_path TEXT NOT NULL,
 			source_size INTEGER NOT NULL,
 			source_mod_unix INTEGER NOT NULL,
@@ -152,11 +172,12 @@ func (s *Store) Migrate(ctx context.Context) error {
 			status TEXT NOT NULL,
 			error TEXT,
 			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL
+			updated_at TEXT NOT NULL,
+			FOREIGN KEY (station_uuid) REFERENCES stations(uuid)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tracks_status ON tracks(status)`,
 		`DROP INDEX IF EXISTS idx_tracks_source_path`,
-		`CREATE INDEX IF NOT EXISTS idx_tracks_source_path_lookup ON tracks(source_path)`,
+		`DROP INDEX IF EXISTS idx_tracks_source_path_lookup`,
 		`CREATE TABLE IF NOT EXISTS track_assets (
 			track_id TEXT NOT NULL,
 			kind TEXT NOT NULL,
@@ -168,68 +189,113 @@ func (s *Store) Migrate(ctx context.Context) error {
 		)`,
 		`CREATE TABLE IF NOT EXISTS schedule_slots (
 			id TEXT PRIMARY KEY,
+			station_uuid TEXT NOT NULL,
 			start_unix_ms INTEGER NOT NULL,
 			end_unix_ms INTEGER NOT NULL,
 			track_id TEXT,
 			is_silence INTEGER NOT NULL,
 			frame_count INTEGER NOT NULL,
 			created_at TEXT NOT NULL,
+			FOREIGN KEY (station_uuid) REFERENCES stations(uuid),
 			FOREIGN KEY (track_id) REFERENCES tracks(id)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_time ON schedule_slots(start_unix_ms, end_unix_ms)`,
-		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_end ON schedule_slots(end_unix_ms)`,
+		`DROP INDEX IF EXISTS idx_schedule_slots_time`,
+		`DROP INDEX IF EXISTS idx_schedule_slots_end`,
 		`CREATE INDEX IF NOT EXISTS idx_tracks_title_nocase ON tracks(title COLLATE NOCASE, id)`,
-		`CREATE INDEX IF NOT EXISTS idx_tracks_status_title_nocase ON tracks(status, title COLLATE NOCASE, id)`,
+		`DROP INDEX IF EXISTS idx_tracks_status_title_nocase`,
 		`CREATE TABLE IF NOT EXISTS settings (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
-		`CREATE TABLE IF NOT EXISTS catalog_state (
-			id INTEGER PRIMARY KEY CHECK (id = 1),
-			revision INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT NOT NULL DEFAULT ''
-		)`,
-		`INSERT OR IGNORE INTO catalog_state(id, revision, updated_at) VALUES (1, 0, datetime('now'))`,
-		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_insert
-			AFTER INSERT ON tracks
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_update
-			AFTER UPDATE ON tracks
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_delete
-			AFTER DELETE ON tracks
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_insert
-			AFTER INSERT ON track_assets
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_update
-			AFTER UPDATE ON track_assets
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
-			END`,
-		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_delete
-			AFTER DELETE ON track_assets
-			BEGIN
-				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE id = 1;
-			END`,
-		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))`,
+		`DROP TRIGGER IF EXISTS trg_tracks_catalog_revision_insert`,
+		`DROP TRIGGER IF EXISTS trg_tracks_catalog_revision_update`,
+		`DROP TRIGGER IF EXISTS trg_tracks_catalog_revision_delete`,
+		`DROP TRIGGER IF EXISTS trg_track_assets_catalog_revision_insert`,
+		`DROP TRIGGER IF EXISTS trg_track_assets_catalog_revision_update`,
+		`DROP TRIGGER IF EXISTS trg_track_assets_catalog_revision_delete`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return err
 		}
 	}
-	if err := s.ensureColumn(ctx, "track_assets", "updated_at", "TEXT NOT NULL DEFAULT ''"); err != nil {
+	for _, col := range []struct {
+		table, column, definition string
+	}{
+		{"tracks", "station_uuid", "TEXT NOT NULL DEFAULT ''"},
+		{"tracks", "content_hash", "TEXT NOT NULL DEFAULT ''"},
+		{"track_assets", "updated_at", "TEXT NOT NULL DEFAULT ''"},
+		{"schedule_slots", "station_uuid", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		if err := s.ensureColumn(ctx, col.table, col.column, col.definition); err != nil {
+			return err
+		}
+	}
+	if ok, err := s.hasColumn(ctx, "catalog_state", "station_uuid"); err != nil {
 		return err
+	} else if !ok {
+		if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS catalog_state`); err != nil {
+			return err
+		}
+	}
+	indexSchema := []string{
+		`CREATE INDEX IF NOT EXISTS idx_tracks_source_path_lookup ON tracks(station_uuid, source_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_time ON schedule_slots(station_uuid, start_unix_ms, end_unix_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_schedule_slots_end ON schedule_slots(station_uuid, end_unix_ms)`,
+		`CREATE INDEX IF NOT EXISTS idx_tracks_status_title_nocase ON tracks(station_uuid, status, title COLLATE NOCASE, id)`,
+	}
+	for _, stmt := range indexSchema {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
+	}
+	catalogSchema := []string{
+		`CREATE TABLE IF NOT EXISTS catalog_state (
+			station_uuid TEXT PRIMARY KEY,
+			revision INTEGER NOT NULL DEFAULT 0,
+			updated_at TEXT NOT NULL DEFAULT '',
+			FOREIGN KEY (station_uuid) REFERENCES stations(uuid)
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_insert
+			AFTER INSERT ON tracks
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = NEW.station_uuid;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_update
+			AFTER UPDATE ON tracks
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = NEW.station_uuid;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_tracks_catalog_revision_delete
+			AFTER DELETE ON tracks
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now') WHERE station_uuid = OLD.station_uuid;
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_insert
+			AFTER INSERT ON track_assets
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
+				WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = NEW.track_id);
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_update
+			AFTER UPDATE ON track_assets
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
+				WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = NEW.track_id);
+			END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_track_assets_catalog_revision_delete
+			AFTER DELETE ON track_assets
+			BEGIN
+				UPDATE catalog_state SET revision = revision + 1, updated_at = datetime('now')
+				WHERE station_uuid = (SELECT station_uuid FROM tracks WHERE id = OLD.track_id);
+			END`,
+		`INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'))`,
+	}
+	for _, stmt := range catalogSchema {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -245,6 +311,66 @@ func (s *Store) ensureColumn(ctx context.Context, table, column, definition stri
 	return err
 }
 
+func (s *Store) hasColumn(ctx context.Context, table, column string) (bool, error) {
+	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var dflt any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
+func (s *Store) UpsertStation(ctx context.Context, st Station) error {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO stations(uuid, alias, enabled, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(uuid) DO UPDATE SET alias=excluded.alias, enabled=excluded.enabled, updated_at=excluded.updated_at
+		WHERE stations.alias IS NOT excluded.alias OR stations.enabled IS NOT excluded.enabled`,
+		st.UUID, st.Alias, boolInt(st.Enabled), now, now)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO catalog_state(station_uuid, revision, updated_at)
+		VALUES (?, 0, datetime('now'))`, st.UUID)
+	return err
+}
+
+func (s *Store) ListStations(ctx context.Context) ([]Station, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT uuid, alias, enabled, created_at, updated_at
+		FROM stations ORDER BY alias COLLATE NOCASE, uuid`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Station
+	for rows.Next() {
+		var st Station
+		var enabled int
+		var created, updated string
+		if err := rows.Scan(&st.UUID, &st.Alias, &enabled, &created, &updated); err != nil {
+			return nil, err
+		}
+		st.Enabled = enabled != 0
+		st.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
+		st.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if t.Status == "" {
@@ -253,16 +379,22 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 	if t.FrameSize == 0 {
 		t.FrameSize = 576
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, updated_at=? WHERE source_path=? AND id<>? AND status<>?`,
-		TrackStatusMissing, now, t.SourcePath, t.ID, TrackStatusMissing); err != nil {
+	if t.ContentHash == "" {
+		t.ContentHash = t.ID
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE tracks SET status=?, updated_at=?
+		WHERE station_uuid=? AND source_path=? AND id<>? AND status<>?`,
+		TrackStatusMissing, now, t.StationUUID, t.SourcePath, t.ID, TrackStatusMissing); err != nil {
 		return err
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO tracks (
-		id, source_path, source_size, source_mod_unix, cache_path, title, artist, album, comment,
+		id, station_uuid, content_hash, source_path, source_size, source_mod_unix, cache_path, title, artist, album, comment,
 		duration_ms, frame_count, frame_size, bitrate, sample_rate, channels, status, error,
 		created_at, updated_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
+		station_uuid=excluded.station_uuid,
+		content_hash=excluded.content_hash,
 		source_path=excluded.source_path,
 		source_size=excluded.source_size,
 		source_mod_unix=excluded.source_mod_unix,
@@ -280,7 +412,9 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		status=excluded.status,
 		error=excluded.error,
 		updated_at=excluded.updated_at
-	WHERE tracks.source_path IS NOT excluded.source_path
+	WHERE tracks.station_uuid IS NOT excluded.station_uuid
+		OR tracks.content_hash IS NOT excluded.content_hash
+		OR tracks.source_path IS NOT excluded.source_path
 		OR tracks.source_size IS NOT excluded.source_size
 		OR tracks.source_mod_unix IS NOT excluded.source_mod_unix
 		OR tracks.cache_path IS NOT excluded.cache_path
@@ -296,7 +430,7 @@ func (s *Store) UpsertTrack(ctx context.Context, t Track) error {
 		OR tracks.channels IS NOT excluded.channels
 		OR tracks.status IS NOT excluded.status
 		OR tracks.error IS NOT excluded.error`,
-		t.ID, t.SourcePath, t.SourceSize, t.SourceModUnix, t.CachePath, t.Title, t.Artist, t.Album, t.Comment,
+		t.ID, t.StationUUID, t.ContentHash, t.SourcePath, t.SourceSize, t.SourceModUnix, t.CachePath, t.Title, t.Artist, t.Album, t.Comment,
 		t.DurationMs, t.FrameCount, t.FrameSize, t.Bitrate, t.SampleRate, t.Channels, t.Status, t.Error,
 		now, now)
 	return err
@@ -334,9 +468,12 @@ func (s *Store) AssetsByTrack(ctx context.Context, trackID string) (map[string]A
 	return out, rows.Err()
 }
 
-func (s *Store) Asset(ctx context.Context, trackID, kind string) (Asset, error) {
+func (s *Store) Asset(ctx context.Context, stationUUID, trackID, kind string) (Asset, error) {
 	var a Asset
-	err := s.db.QueryRowContext(ctx, `SELECT track_id, kind, path, mime FROM track_assets WHERE track_id=? AND kind=?`, trackID, kind).
+	err := s.db.QueryRowContext(ctx, `SELECT a.track_id, a.kind, a.path, a.mime
+		FROM track_assets a
+		JOIN tracks t ON t.id=a.track_id
+		WHERE t.station_uuid=? AND a.track_id=? AND a.kind=?`, stationUUID, trackID, kind).
 		Scan(&a.TrackID, &a.Kind, &a.Path, &a.MIME)
 	if err != nil {
 		return Asset{}, err
@@ -344,8 +481,12 @@ func (s *Store) Asset(ctx context.Context, trackID, kind string) (Asset, error) 
 	return a, nil
 }
 
-func (s *Store) ListAssets(ctx context.Context) ([]Asset, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT track_id, kind, path, mime FROM track_assets ORDER BY track_id, kind`)
+func (s *Store) ListAssets(ctx context.Context, stationUUID string) ([]Asset, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT a.track_id, a.kind, a.path, a.mime
+		FROM track_assets a
+		JOIN tracks t ON t.id=a.track_id
+		WHERE t.station_uuid=?
+		ORDER BY a.track_id, a.kind`, stationUUID)
 	if err != nil {
 		return nil, err
 	}
@@ -362,9 +503,9 @@ func (s *Store) ListAssets(ctx context.Context) ([]Asset, error) {
 	return out, rows.Err()
 }
 
-func (s *Store) CatalogRevision(ctx context.Context) (CatalogRevision, error) {
+func (s *Store) CatalogRevision(ctx context.Context, stationUUID string) (CatalogRevision, error) {
 	var rev CatalogRevision
-	err := s.db.QueryRowContext(ctx, `SELECT revision, updated_at FROM catalog_state WHERE id=1`).
+	err := s.db.QueryRowContext(ctx, `SELECT revision, updated_at FROM catalog_state WHERE station_uuid=?`, stationUUID).
 		Scan(&rev.Revision, &rev.UpdatedAt)
 	if err != nil {
 		return CatalogRevision{}, err
@@ -378,8 +519,8 @@ func (s *Store) SetTrackStatus(ctx context.Context, id, status string, errText s
 	return err
 }
 
-func (s *Store) MarkMissingExcept(ctx context.Context, seen map[string]struct{}) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, source_path FROM tracks WHERE status=?`, TrackStatusActive)
+func (s *Store) MarkMissingExcept(ctx context.Context, stationUUID string, seen map[string]struct{}) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, source_path FROM tracks WHERE station_uuid=? AND status=?`, stationUUID, TrackStatusActive)
 	if err != nil {
 		return nil, err
 	}
@@ -411,22 +552,23 @@ func (s *Store) MarkMissingExcept(ctx context.Context, seen map[string]struct{})
 	return ids, nil
 }
 
-func (s *Store) ListActiveTracks(ctx context.Context) ([]Track, error) {
-	return s.listTracks(ctx, `WHERE status='active' ORDER BY title COLLATE NOCASE, id`)
+func (s *Store) ListActiveTracks(ctx context.Context, stationUUID string) ([]Track, error) {
+	return s.listTracks(ctx, `WHERE station_uuid=? AND status='active' ORDER BY title COLLATE NOCASE, id`, stationUUID)
 }
 
 func (s *Store) ListTracks(ctx context.Context) ([]Track, error) {
-	return s.listTracks(ctx, `ORDER BY title COLLATE NOCASE, id`)
+	return s.listTracks(ctx, `ORDER BY station_uuid, title COLLATE NOCASE, id`)
 }
 
-func (s *Store) ListCatalogPage(ctx context.Context, afterTitle, afterID string, limit int) ([]CatalogTrack, error) {
+func (s *Store) ListCatalogPage(ctx context.Context, stationUUID, afterTitle, afterID string, limit int) ([]CatalogTrack, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
 	rows, err := s.db.QueryContext(ctx, `WITH page AS (
 			SELECT t.id, t.title, t.artist, t.album, t.duration_ms
 			FROM tracks t
-			WHERE t.status=?
+			WHERE t.station_uuid=?
+				AND t.status=?
 				AND ((?='' AND ?='') OR t.title COLLATE NOCASE > ? COLLATE NOCASE
 					OR (t.title COLLATE NOCASE = ? COLLATE NOCASE AND t.id > ?))
 			ORDER BY t.title COLLATE NOCASE, t.id
@@ -440,7 +582,7 @@ func (s *Store) ListCatalogPage(ctx context.Context, afterTitle, afterID string,
 		LEFT JOIN track_assets a ON a.track_id=p.id AND a.kind IN ('cover', 'lyrics')
 		GROUP BY p.id, p.title, p.artist, p.album, p.duration_ms
 		ORDER BY p.title COLLATE NOCASE, p.id`,
-		TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
+		stationUUID, TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -454,10 +596,10 @@ func (s *Store) ListCatalogPage(ctx context.Context, afterTitle, afterID string,
 			return nil, err
 		}
 		if hasCover != 0 {
-			t.CoverURL = "/covers/" + t.ID
+			t.CoverURL = "/radio/" + stationUUID + "/covers/" + t.ID
 		}
 		if hasLyrics != 0 {
-			t.LyricsURL = "/lyrics/" + t.ID
+			t.LyricsURL = "/radio/" + stationUUID + "/lyrics/" + t.ID
 		}
 		out = append(out, t)
 	}
@@ -534,8 +676,8 @@ func (s *Store) Track(ctx context.Context, id string) (Track, error) {
 	return t, rows.Err()
 }
 
-func (s *Store) listTracks(ctx context.Context, suffix string) ([]Track, error) {
-	rows, err := s.db.QueryContext(ctx, selectTracksSQL()+` `+suffix)
+func (s *Store) listTracks(ctx context.Context, suffix string, args ...any) ([]Track, error) {
+	rows, err := s.db.QueryContext(ctx, selectTracksSQL()+` `+suffix, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +695,7 @@ func (s *Store) listTracks(ctx context.Context, suffix string) ([]Track, error) 
 }
 
 func selectTracksSQL() string {
-	return `SELECT id, source_path, source_size, source_mod_unix, cache_path, title, artist, album, comment,
+	return `SELECT id, station_uuid, content_hash, source_path, source_size, source_mod_unix, cache_path, title, artist, album, comment,
 		duration_ms, frame_count, frame_size, bitrate, sample_rate, channels, status, error, created_at, updated_at FROM tracks`
 }
 
@@ -562,7 +704,7 @@ func scanTrack(rows interface {
 }) (Track, error) {
 	var t Track
 	var created, updated string
-	if err := rows.Scan(&t.ID, &t.SourcePath, &t.SourceSize, &t.SourceModUnix, &t.CachePath, &t.Title, &t.Artist, &t.Album, &t.Comment,
+	if err := rows.Scan(&t.ID, &t.StationUUID, &t.ContentHash, &t.SourcePath, &t.SourceSize, &t.SourceModUnix, &t.CachePath, &t.Title, &t.Artist, &t.Album, &t.Comment,
 		&t.DurationMs, &t.FrameCount, &t.FrameSize, &t.Bitrate, &t.SampleRate, &t.Channels, &t.Status, &t.Error, &created, &updated); err != nil {
 		return Track{}, err
 	}
@@ -571,26 +713,27 @@ func scanTrack(rows interface {
 	return t, nil
 }
 
-func (s *Store) DeleteSlotsBefore(ctx context.Context, cutoffMs int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_slots WHERE end_unix_ms < ?`, cutoffMs)
+func (s *Store) DeleteSlotsBefore(ctx context.Context, stationUUID string, cutoffMs int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_slots WHERE station_uuid=? AND end_unix_ms < ?`, stationUUID, cutoffMs)
 	return err
 }
 
-func (s *Store) DeleteFutureSlots(ctx context.Context, cutoffMs int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_slots WHERE start_unix_ms > ?`, cutoffMs)
+func (s *Store) DeleteFutureSlots(ctx context.Context, stationUUID string, cutoffMs int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM schedule_slots WHERE station_uuid=? AND start_unix_ms > ?`, stationUUID, cutoffMs)
 	return err
 }
 
 func (s *Store) UpsertSlot(ctx context.Context, sl Slot) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO schedule_slots(id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO schedule_slots(id, station_uuid, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			station_uuid=excluded.station_uuid,
 			start_unix_ms=excluded.start_unix_ms,
 			end_unix_ms=excluded.end_unix_ms,
 			track_id=excluded.track_id,
 			is_silence=excluded.is_silence,
 			frame_count=excluded.frame_count`,
-		sl.ID, sl.StartUnixMs, sl.EndUnixMs, nullableString(sl.TrackID), boolInt(sl.IsSilence), sl.FrameCount, time.Now().UTC().Format(time.RFC3339Nano))
+		sl.ID, sl.StationUUID, sl.StartUnixMs, sl.EndUnixMs, nullableString(sl.TrackID), boolInt(sl.IsSilence), sl.FrameCount, time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
@@ -602,9 +745,10 @@ func (s *Store) UpsertSlots(ctx context.Context, slots []Slot) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.PrepareContext(ctx, `INSERT INTO schedule_slots(id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+	stmt, err := tx.PrepareContext(ctx, `INSERT INTO schedule_slots(id, station_uuid, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			station_uuid=excluded.station_uuid,
 			start_unix_ms=excluded.start_unix_ms,
 			end_unix_ms=excluded.end_unix_ms,
 			track_id=excluded.track_id,
@@ -617,7 +761,7 @@ func (s *Store) UpsertSlots(ctx context.Context, slots []Slot) error {
 	defer stmt.Close()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	for _, sl := range slots {
-		if _, err := stmt.ExecContext(ctx, sl.ID, sl.StartUnixMs, sl.EndUnixMs, nullableString(sl.TrackID), boolInt(sl.IsSilence), sl.FrameCount, now); err != nil {
+		if _, err := stmt.ExecContext(ctx, sl.ID, sl.StationUUID, sl.StartUnixMs, sl.EndUnixMs, nullableString(sl.TrackID), boolInt(sl.IsSilence), sl.FrameCount, now); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -625,9 +769,9 @@ func (s *Store) UpsertSlots(ctx context.Context, slots []Slot) error {
 	return tx.Commit()
 }
 
-func (s *Store) SlotsEndingAfter(ctx context.Context, unixMs int64) ([]Slot, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
-		FROM schedule_slots WHERE end_unix_ms > ? ORDER BY end_unix_ms ASC`, unixMs)
+func (s *Store) SlotsEndingAfter(ctx context.Context, stationUUID string, unixMs int64) ([]Slot, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, station_uuid, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
+		FROM schedule_slots WHERE station_uuid=? AND end_unix_ms > ? ORDER BY end_unix_ms ASC`, stationUUID, unixMs)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +781,7 @@ func (s *Store) SlotsEndingAfter(ctx context.Context, unixMs int64) ([]Slot, err
 	for rows.Next() {
 		var sl Slot
 		var isSilence int
-		if err := rows.Scan(&sl.ID, &sl.StartUnixMs, &sl.EndUnixMs, &sl.TrackID, &isSilence, &sl.FrameCount); err != nil {
+		if err := rows.Scan(&sl.ID, &sl.StationUUID, &sl.StartUnixMs, &sl.EndUnixMs, &sl.TrackID, &isSilence, &sl.FrameCount); err != nil {
 			return nil, err
 		}
 		sl.IsSilence = isSilence != 0
@@ -646,12 +790,12 @@ func (s *Store) SlotsEndingAfter(ctx context.Context, unixMs int64) ([]Slot, err
 	return out, rows.Err()
 }
 
-func (s *Store) SlotAt(ctx context.Context, unixMs int64) (Slot, error) {
+func (s *Store) SlotAt(ctx context.Context, stationUUID string, unixMs int64) (Slot, error) {
 	var sl Slot
 	var isSilence int
-	err := s.db.QueryRowContext(ctx, `SELECT id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
-		FROM schedule_slots WHERE start_unix_ms <= ? AND end_unix_ms > ? ORDER BY start_unix_ms DESC LIMIT 1`, unixMs, unixMs).
-		Scan(&sl.ID, &sl.StartUnixMs, &sl.EndUnixMs, &sl.TrackID, &isSilence, &sl.FrameCount)
+	err := s.db.QueryRowContext(ctx, `SELECT id, station_uuid, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
+		FROM schedule_slots WHERE station_uuid=? AND start_unix_ms <= ? AND end_unix_ms > ? ORDER BY start_unix_ms DESC LIMIT 1`, stationUUID, unixMs, unixMs).
+		Scan(&sl.ID, &sl.StationUUID, &sl.StartUnixMs, &sl.EndUnixMs, &sl.TrackID, &isSilence, &sl.FrameCount)
 	if err != nil {
 		return Slot{}, err
 	}
@@ -659,12 +803,12 @@ func (s *Store) SlotAt(ctx context.Context, unixMs int64) (Slot, error) {
 	return sl, nil
 }
 
-func (s *Store) LastSlot(ctx context.Context) (Slot, error) {
+func (s *Store) LastSlot(ctx context.Context, stationUUID string) (Slot, error) {
 	var sl Slot
 	var isSilence int
-	err := s.db.QueryRowContext(ctx, `SELECT id, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
-		FROM schedule_slots ORDER BY end_unix_ms DESC LIMIT 1`).
-		Scan(&sl.ID, &sl.StartUnixMs, &sl.EndUnixMs, &sl.TrackID, &isSilence, &sl.FrameCount)
+	err := s.db.QueryRowContext(ctx, `SELECT id, station_uuid, start_unix_ms, end_unix_ms, track_id, is_silence, frame_count
+		FROM schedule_slots WHERE station_uuid=? ORDER BY end_unix_ms DESC LIMIT 1`, stationUUID).
+		Scan(&sl.ID, &sl.StationUUID, &sl.StartUnixMs, &sl.EndUnixMs, &sl.TrackID, &isSilence, &sl.FrameCount)
 	if err != nil {
 		return Slot{}, err
 	}

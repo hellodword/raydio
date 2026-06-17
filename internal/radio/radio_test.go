@@ -11,6 +11,8 @@ import (
 	"raydio/internal/store"
 )
 
+const testStationUUID = "00000000-0000-0000-0000-000000000001"
+
 func TestSchedulerCreatesTrackAndGapSlots(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
@@ -18,9 +20,11 @@ func TestSchedulerCreatesTrackAndGapSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	track := store.Track{
 		ID:            "abcdef1234567890",
+		StationUUID:   testStationUUID,
 		SourcePath:    "/inbox/a.mp3",
 		CachePath:     "/cache/a.mp3",
 		Title:         "A",
@@ -39,12 +43,12 @@ func TestSchedulerCreatesTrackAndGapSlots(t *testing.T) {
 	}
 
 	now := time.Unix(100, 0)
-	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s := NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5)
 	s.fillAhead = 10 * time.Second
 	if err := s.Ensure(ctx, now); err != nil {
 		t.Fatal(err)
 	}
-	slots, err := st.SlotsEndingAfter(ctx, now.UnixMilli())
+	slots, err := st.SlotsEndingAfter(ctx, testStationUUID, now.UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,9 +70,10 @@ func TestSchedulerUsesSilenceWhenCatalogEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	now := time.Unix(100, 0)
-	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s := NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5)
 	s.fillAhead = 100 * time.Millisecond
 	if err := s.Ensure(ctx, now); err != nil {
 		t.Fatal(err)
@@ -89,13 +94,14 @@ func TestPositionDoesNotMutateSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	now := time.Unix(100, 0)
-	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s := NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5)
 	if _, err := s.Position(ctx, now); !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("Position error = %v, want sql.ErrNoRows", err)
 	}
-	slots, err := st.SlotsEndingAfter(ctx, now.UnixMilli())
+	slots, err := st.SlotsEndingAfter(ctx, testStationUUID, now.UnixMilli())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,9 +117,10 @@ func TestPositionOrEnsureRefillsMissingSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	now := time.Unix(100, 0)
-	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s := NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5)
 	s.fillAhead = 100 * time.Millisecond
 	pos, err := s.PositionOrEnsure(ctx, now)
 	if err != nil {
@@ -131,9 +138,10 @@ func TestNowAndChunksRecoverFromMissingSchedule(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
+	mustUpsertStation(t, ctx, st)
 
 	now := time.Unix(100, 0)
-	s := NewScheduler(st, "/cache/silence.mp3", 5)
+	s := NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5)
 	s.fillAhead = 100 * time.Millisecond
 	gotNow, err := s.Now(ctx, now)
 	if err != nil {
@@ -148,5 +156,12 @@ func TestNowAndChunksRecoverFromMissingSchedule(t *testing.T) {
 	}
 	if len(chunks) == 0 || chunks[0].Path != "/cache/silence.mp3" {
 		t.Fatalf("expected silence chunks, got %+v", chunks)
+	}
+}
+
+func mustUpsertStation(t *testing.T, ctx context.Context, st *store.Store) {
+	t.Helper()
+	if err := st.UpsertStation(ctx, store.Station{UUID: testStationUUID, Alias: "monthly", Enabled: true}); err != nil {
+		t.Fatal(err)
 	}
 }

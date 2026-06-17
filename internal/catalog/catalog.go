@@ -20,6 +20,7 @@ import (
 )
 
 type Config struct {
+	StationUUID   string
 	InboxDir      string
 	CacheDir      string
 	SilenceFrames int64
@@ -114,7 +115,7 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 	if err != nil {
 		return result, err
 	}
-	missing, err := s.store.MarkMissingExcept(ctx, seen)
+	missing, err := s.store.MarkMissingExcept(ctx, s.cfg.StationUUID, seen)
 	if err != nil {
 		return result, err
 	}
@@ -122,7 +123,7 @@ func (s *Service) Scan(ctx context.Context) (ScanResult, error) {
 		result.Changed = true
 	}
 	if result.Changed {
-		if err := s.store.DeleteFutureSlots(ctx, time.Now().UnixMilli()); err != nil {
+		if err := s.store.DeleteFutureSlots(ctx, s.cfg.StationUUID, time.Now().UnixMilli()); err != nil {
 			return result, err
 		}
 	}
@@ -134,8 +135,9 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 	if err != nil {
 		return false, err
 	}
-	id := hex.EncodeToString(sum[:])
-	cachePath := filepath.Join(s.cfg.CacheDir, "tracks", id+".mp3")
+	contentHash := hex.EncodeToString(sum[:])
+	id := stationTrackID(s.cfg.StationUUID, contentHash)
+	cachePath := filepath.Join(s.cfg.CacheDir, "tracks", contentHash+".mp3")
 	changed := false
 	if _, err := os.Stat(cachePath); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -169,6 +171,8 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 
 	t := store.Track{
 		ID:            id,
+		StationUUID:   s.cfg.StationUUID,
+		ContentHash:   contentHash,
 		SourcePath:    path,
 		SourceSize:    info.Size(),
 		SourceModUnix: info.ModTime().Unix(),
@@ -203,7 +207,9 @@ func (s *Service) processFile(ctx context.Context, path string, info os.FileInfo
 }
 
 func trackChanged(old, next store.Track) bool {
-	return old.SourcePath != next.SourcePath ||
+	return old.StationUUID != next.StationUUID ||
+		old.ContentHash != next.ContentHash ||
+		old.SourcePath != next.SourcePath ||
 		old.SourceSize != next.SourceSize ||
 		old.SourceModUnix != next.SourceModUnix ||
 		old.CachePath != next.CachePath ||
@@ -225,8 +231,14 @@ func (s *Service) markFileError(ctx context.Context, path string, err error) err
 	if sumErr != nil {
 		return sumErr
 	}
-	id := hex.EncodeToString(sum[:])
+	contentHash := hex.EncodeToString(sum[:])
+	id := stationTrackID(s.cfg.StationUUID, contentHash)
 	return s.store.SetTrackStatus(ctx, id, store.TrackStatusError, sql.NullString{String: err.Error(), Valid: true})
+}
+
+func stationTrackID(stationUUID, contentHash string) string {
+	sum := sha256.Sum256([]byte(stationUUID + "\x00" + contentHash))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Service) syncAssets(ctx context.Context, trackID, sourcePath string, probe audio.Probe) error {
