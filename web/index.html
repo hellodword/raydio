@@ -15,27 +15,19 @@
       <section class="meta">
         <div id="status" class="status">connecting</div>
         <h1 id="title">No track</h1>
-        <p id="artist">Unknown artist</p>
+        <a id="artist" target="_blank" rel="noreferrer">Unknown artist</a>
       </section>
       <section class="controls" aria-label="Controls">
         <label class="station">
           <span>Station</span>
           <select id="station"></select>
         </label>
-        <button id="play" type="button">Play</button>
-        <button id="pause" type="button">Pause</button>
-        <label class="volume">
-          <span>Volume</span>
-          <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8" />
-        </label>
+        <button id="play" type="button">播放</button>
       </section>
-      <section class="command" aria-label="Terminal command">
-        <div class="commandHead">
-          <span>Terminal</span>
-          <button id="copyCommand" type="button">Copy</button>
-          <span id="copyStatus" class="copyStatus" aria-live="polite"></span>
-        </div>
-        <code id="streamCommand"></code>
+      <section class="command" aria-label="Stream command">
+        <span id="copyStatus" class="copyStatus" aria-live="polite"></span>
+        <code id="streamUrl" class="copyBox" tabindex="0" role="button" aria-label="Copy stream URL"></code>
+        <code id="streamCommand" class="copyBox" tabindex="0" role="button" aria-label="Copy curl command"></code>
       </section>
     </main>
     <audio id="audio" preload="none"></audio>
