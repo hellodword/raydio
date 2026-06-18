@@ -15,6 +15,8 @@ log_level: INFO
 radios:
   # Each configured radio scans <worker.inbox_dir>/<uuid> and streams at
   # /radio/<alias> and /radio/<uuid>.
+  # raydio also exposes a built-in aggregate station at /radio/all, so "all" is
+  # reserved and should not be used as a configured alias.
   # - alias: k-pop
   #   uuid: ca1838a1-5fbe-4b47-bd73-f964bf2b5464
   - alias: electronic

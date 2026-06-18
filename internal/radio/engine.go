@@ -19,6 +19,7 @@ import (
 
 type EngineConfig struct {
 	StationUUID        string
+	AssetRoute         string
 	Scheduler          *Scheduler
 	Store              *store.Store
 	SilencePath        string
@@ -140,7 +141,7 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	rev, err := e.cfg.Store.CatalogRevision(ctx, e.cfg.StationUUID)
+	rev, err := e.cfg.Store.CatalogRevisionForStations(ctx, e.sourceStationUUIDs())
 	if err != nil {
 		return err
 	}
@@ -167,7 +168,7 @@ func (e *Engine) Refresh(ctx context.Context, now time.Time) error {
 	if err != nil {
 		return err
 	}
-	urls := assetURLsByTrack(e.cfg.StationUUID, assets)
+	urls := assetURLsByTrack(e.assetRoute(), assets)
 
 	e.stateMu.Lock()
 	e.slots = slots
@@ -185,6 +186,20 @@ func (e *Engine) Now() Now {
 		return v.(Now)
 	}
 	return Now{ServerTimeMs: time.Now().UnixMilli()}
+}
+
+func (e *Engine) sourceStationUUIDs() []string {
+	if e.cfg.Scheduler != nil && len(e.cfg.Scheduler.sourceStationUUIDs) != 0 {
+		return e.cfg.Scheduler.sourceStationUUIDs
+	}
+	return []string{e.cfg.StationUUID}
+}
+
+func (e *Engine) assetRoute() string {
+	if e.cfg.AssetRoute != "" {
+		return e.cfg.AssetRoute
+	}
+	return e.cfg.StationUUID
 }
 
 func (e *Engine) Asset(trackID, kind string) (store.Asset, bool) {

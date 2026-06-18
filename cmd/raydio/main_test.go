@@ -72,6 +72,20 @@ func TestValidateConfigRejectsInvalidRateLimit(t *testing.T) {
 	}
 }
 
+func TestValidateConfigRejectsReservedAggregateStation(t *testing.T) {
+	cfg := validTestConfig()
+	cfg.Radios = []radioConfig{{Alias: aggregateStationAlias, UUID: testStationUUID}}
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("alias error = %v, want reserved error", err)
+	}
+
+	cfg = validTestConfig()
+	cfg.Radios = []radioConfig{{Alias: "monthly", UUID: aggregateStationUUID}}
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("uuid error = %v, want reserved error", err)
+	}
+}
+
 func TestReadConfigLoadsServerSettings(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(`
@@ -356,6 +370,100 @@ func TestHandleCatalogPaginatesAndUsesETag(t *testing.T) {
 	}
 }
 
+func TestHandleAggregateCatalogUsesAllSourcesAndCoverRoute(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mustUpsertStation(t, ctx, st)
+	second := "00000000-0000-0000-0000-000000000002"
+	if err := st.UpsertStation(ctx, store.Station{UUID: second, Alias: "daily", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, track := range []store.Track{
+		{ID: "aaa", StationUUID: testStationUUID, SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+		{ID: "bbb", StationUUID: second, SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1},
+	} {
+		if err := st.UpsertTrack(ctx, track); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertAsset(ctx, store.Asset{TrackID: "bbb", Kind: "cover", Path: "/cache/b.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := testApp(st)
+	a.stations[aggregateStationAlias].sourceStationUUIDs = []string{testStationUUID, second}
+	req := httptest.NewRequest(http.MethodGet, "/radio/all/api/catalog?limit=10", nil)
+	req.SetPathValue("station", aggregateStationAlias)
+	rr := httptest.NewRecorder()
+	a.handleCatalog(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var page struct {
+		Tracks []store.CatalogTrack `json:"tracks"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Tracks) != 2 || page.Tracks[0].ID != "aaa" || page.Tracks[1].ID != "bbb" {
+		t.Fatalf("page = %+v", page)
+	}
+	if page.Tracks[1].CoverURL != "/radio/all/covers/bbb" {
+		t.Fatalf("cover URL = %q", page.Tracks[1].CoverURL)
+	}
+}
+
+func TestHandleAggregateAssetLooksUpSourceStation(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mustUpsertStation(t, ctx, st)
+	second := "00000000-0000-0000-0000-000000000002"
+	if err := st.UpsertStation(ctx, store.Station{UUID: second, Alias: "daily", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	track := store.Track{ID: "bbb", StationUUID: second, SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: store.TrackStatusActive, SourceModUnix: 1}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	cacheDir := t.TempDir()
+	coverDir := filepath.Join(cacheDir, "covers")
+	if err := os.MkdirAll(coverDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	coverPath := filepath.Join(coverDir, "b.jpg")
+	if err := os.WriteFile(coverPath, []byte("cover"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAsset(ctx, store.Asset{TrackID: "bbb", Kind: "cover", Path: coverPath, MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	a := testApp(st)
+	a.cfg.CacheDir = cacheDir
+	a.stations[aggregateStationAlias].sourceStationUUIDs = []string{testStationUUID, second}
+	req := httptest.NewRequest(http.MethodGet, "/radio/all/covers/bbb", nil)
+	req.SetPathValue("station", aggregateStationAlias)
+	req.SetPathValue("id", "bbb")
+	rr := httptest.NewRecorder()
+	a.handleAsset("cover")(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.String() != "cover" {
+		t.Fatalf("body = %q", rr.Body.String())
+	}
+}
+
 func TestRateLimitMiddlewareLimitsAPIAndExemptsHealthz(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/stations", func(w http.ResponseWriter, r *http.Request) {
@@ -540,6 +648,9 @@ func TestHandleStationsReturnsConfiguredStations(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), `"alias":"monthly"`) || !strings.Contains(rr.Body.String(), testStationUUID) {
 		t.Fatalf("stations body = %s", rr.Body.String())
 	}
+	if !strings.Contains(rr.Body.String(), `"alias":"all"`) || !strings.Contains(rr.Body.String(), aggregateStationUUID) {
+		t.Fatalf("stations body missing aggregate: %s", rr.Body.String())
+	}
 }
 
 func TestHandleCatalogInternalErrorIsGeneric(t *testing.T) {
@@ -658,11 +769,40 @@ func mustUpsertStation(t *testing.T, ctx context.Context, st *store.Store) {
 }
 
 func testApp(st *store.Store) *app {
-	rt := &stationRuntime{station: radioConfig{Alias: "monthly", UUID: testStationUUID}}
+	rt := &stationRuntime{
+		station:            radioConfig{Alias: "monthly", UUID: testStationUUID},
+		sourceStationUUIDs: []string{testStationUUID},
+		catalogRoute:       testStationUUID,
+	}
+	all := &stationRuntime{
+		station:            radioConfig{Alias: aggregateStationAlias, UUID: aggregateStationUUID},
+		sourceStationUUIDs: []string{testStationUUID},
+		catalogRoute:       aggregateStationAlias,
+	}
 	return &app{
-		store:      st,
-		stations:   map[string]*stationRuntime{"monthly": rt, testStationUUID: rt},
-		stationIDs: []string{testStationUUID},
+		store: st,
+		stations: map[string]*stationRuntime{
+			"monthly":             rt,
+			testStationUUID:       rt,
+			aggregateStationAlias: all,
+			aggregateStationUUID:  all,
+		},
+		stationIDs: []string{testStationUUID, aggregateStationUUID},
+	}
+}
+
+func validTestConfig() config {
+	return config{
+		RateLimitRPS:       10,
+		RateLimitBurst:     30,
+		MaxStreamsPerIP:    4,
+		MaxEventsPerIP:     8,
+		ScheduleInterval:   time.Second,
+		StreamChunkWindow:  minStreamChunkWindow,
+		StreamBufferWindow: time.Second,
+		StreamWriteTimeout: time.Second,
+		GapFrames:          1,
+		Radios:             []radioConfig{{Alias: "monthly", UUID: testStationUUID}},
 	}
 }
 

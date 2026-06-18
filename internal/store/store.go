@@ -507,11 +507,24 @@ func (s *Store) AssetsByTrack(ctx context.Context, trackID string) (map[string]A
 }
 
 func (s *Store) Asset(ctx context.Context, stationUUID, trackID, kind string) (Asset, error) {
+	return s.AssetForStations(ctx, []string{stationUUID}, trackID, kind)
+}
+
+func (s *Store) AssetForStations(ctx context.Context, stationUUIDs []string, trackID, kind string) (Asset, error) {
+	stationUUIDs = uniqueStrings(stationUUIDs)
+	if len(stationUUIDs) == 0 {
+		return Asset{}, sql.ErrNoRows
+	}
+	args := make([]any, 0, len(stationUUIDs)+2)
+	for _, id := range stationUUIDs {
+		args = append(args, id)
+	}
+	args = append(args, trackID, kind)
 	var a Asset
 	err := s.db.QueryRowContext(ctx, `SELECT a.track_id, a.kind, a.path, a.mime
 		FROM track_assets a
 		JOIN tracks t ON t.id=a.track_id
-		WHERE t.station_uuid=? AND a.track_id=? AND a.kind=?`, stationUUID, trackID, kind).
+		WHERE t.station_uuid IN (`+QuotePlaceholders(len(stationUUIDs))+`) AND a.track_id=? AND a.kind=?`, args...).
 		Scan(&a.TrackID, &a.Kind, &a.Path, &a.MIME)
 	if err != nil {
 		return Asset{}, err
@@ -520,8 +533,21 @@ func (s *Store) Asset(ctx context.Context, stationUUID, trackID, kind string) (A
 }
 
 func (s *Store) CatalogRevision(ctx context.Context, stationUUID string) (CatalogRevision, error) {
+	return s.CatalogRevisionForStations(ctx, []string{stationUUID})
+}
+
+func (s *Store) CatalogRevisionForStations(ctx context.Context, stationUUIDs []string) (CatalogRevision, error) {
+	stationUUIDs = uniqueStrings(stationUUIDs)
+	if len(stationUUIDs) == 0 {
+		return CatalogRevision{}, nil
+	}
+	args := make([]any, 0, len(stationUUIDs))
+	for _, id := range stationUUIDs {
+		args = append(args, id)
+	}
 	var rev CatalogRevision
-	err := s.db.QueryRowContext(ctx, `SELECT revision, updated_at FROM catalog_state WHERE station_uuid=?`, stationUUID).
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(revision), 0), COALESCE(MAX(updated_at), '')
+		FROM catalog_state WHERE station_uuid IN (`+QuotePlaceholders(len(stationUUIDs))+`)`, args...).
 		Scan(&rev.Revision, &rev.UpdatedAt)
 	if err != nil {
 		return CatalogRevision{}, err
@@ -572,18 +598,44 @@ func (s *Store) ListActiveTracks(ctx context.Context, stationUUID string) ([]Tra
 	return s.listTracks(ctx, `WHERE station_uuid=? AND status='active' ORDER BY title COLLATE NOCASE, id`, stationUUID)
 }
 
+func (s *Store) ListActiveTracksForStations(ctx context.Context, stationUUIDs []string) ([]Track, error) {
+	stationUUIDs = uniqueStrings(stationUUIDs)
+	if len(stationUUIDs) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(stationUUIDs)+1)
+	for _, id := range stationUUIDs {
+		args = append(args, id)
+	}
+	args = append(args, TrackStatusActive)
+	return s.listTracks(ctx, `WHERE station_uuid IN (`+QuotePlaceholders(len(stationUUIDs))+`) AND status=? ORDER BY station_uuid, title COLLATE NOCASE, id`, args...)
+}
+
 func (s *Store) ListTracks(ctx context.Context) ([]Track, error) {
 	return s.listTracks(ctx, `ORDER BY station_uuid, title COLLATE NOCASE, id`)
 }
 
 func (s *Store) ListCatalogPage(ctx context.Context, stationUUID, afterTitle, afterID string, limit int) ([]CatalogTrack, error) {
+	return s.ListCatalogPageForStations(ctx, []string{stationUUID}, stationUUID, afterTitle, afterID, limit)
+}
+
+func (s *Store) ListCatalogPageForStations(ctx context.Context, stationUUIDs []string, routeStation, afterTitle, afterID string, limit int) ([]CatalogTrack, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
+	stationUUIDs = uniqueStrings(stationUUIDs)
+	if len(stationUUIDs) == 0 {
+		return nil, nil
+	}
+	args := make([]any, 0, len(stationUUIDs)+7)
+	for _, id := range stationUUIDs {
+		args = append(args, id)
+	}
+	args = append(args, TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
 	rows, err := s.db.QueryContext(ctx, `WITH page AS (
 			SELECT t.id, t.title, t.artist, t.album, t.duration_ms
 			FROM tracks t
-			WHERE t.station_uuid=?
+			WHERE t.station_uuid IN (`+QuotePlaceholders(len(stationUUIDs))+`)
 				AND t.status=?
 				AND ((?='' AND ?='') OR t.title COLLATE NOCASE > ? COLLATE NOCASE
 					OR (t.title COLLATE NOCASE = ? COLLATE NOCASE AND t.id > ?))
@@ -597,7 +649,7 @@ func (s *Store) ListCatalogPage(ctx context.Context, stationUUID, afterTitle, af
 		LEFT JOIN track_assets a ON a.track_id=p.id AND a.kind='cover'
 		GROUP BY p.id, p.title, p.artist, p.album, p.duration_ms
 		ORDER BY p.title COLLATE NOCASE, p.id`,
-		stationUUID, TrackStatusActive, afterTitle, afterID, afterTitle, afterTitle, afterID, limit)
+		args...)
 	if err != nil {
 		return nil, err
 	}
@@ -611,7 +663,7 @@ func (s *Store) ListCatalogPage(ctx context.Context, stationUUID, afterTitle, af
 			return nil, err
 		}
 		if hasCover != 0 {
-			t.CoverURL = "/radio/" + stationUUID + "/covers/" + t.ID
+			t.CoverURL = "/radio/" + routeStation + "/covers/" + t.ID
 		}
 		out = append(out, t)
 	}

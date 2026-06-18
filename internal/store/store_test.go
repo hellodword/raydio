@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const testStationUUID = "00000000-0000-0000-0000-000000000001"
+const (
+	testStationUUID   = "00000000-0000-0000-0000-000000000001"
+	secondStationUUID = "00000000-0000-0000-0000-000000000002"
+)
 
 func TestMigrationAndTrackUpsert(t *testing.T) {
 	ctx := context.Background()
@@ -285,6 +288,71 @@ func TestListCatalogPageReturnsPublicFieldsAndAssetURLs(t *testing.T) {
 	}
 	if len(next) != 1 || next[0].ID != "ccc" {
 		t.Fatalf("next page = %+v", next)
+	}
+}
+
+func TestMultiStationCatalogQueries(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mustUpsertStation(t, ctx, st)
+	if err := st.UpsertStation(ctx, Station{UUID: secondStationUUID, Alias: "daily", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	tracks := []Track{
+		{ID: "aaa", StationUUID: testStationUUID, SourcePath: "/music/a.mp3", CachePath: "/cache/a.mp3", Title: "Alpha", Artist: "Artist", DurationMs: 1000, FrameCount: 42, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "bbb", StationUUID: secondStationUUID, SourcePath: "/music/b.mp3", CachePath: "/cache/b.mp3", Title: "Bravo", Artist: "Artist", DurationMs: 2000, FrameCount: 84, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusActive, SourceModUnix: 1},
+		{ID: "ccc", StationUUID: secondStationUUID, SourcePath: "/music/c.mp3", CachePath: "/cache/c.mp3", Title: "Charlie", Artist: "Artist", DurationMs: 3000, FrameCount: 125, FrameSize: 576, Bitrate: 192000, SampleRate: 48000, Channels: 2, Status: TrackStatusMissing, SourceModUnix: 1},
+	}
+	for _, track := range tracks {
+		if err := st.UpsertTrack(ctx, track); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertAsset(ctx, Asset{TrackID: "bbb", Kind: "cover", Path: "/cache/b.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	active, err := st.ListActiveTracksForStations(ctx, []string{secondStationUUID, testStationUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 {
+		t.Fatalf("active tracks = %+v", active)
+	}
+
+	rev, err := st.CatalogRevisionForStations(ctx, []string{testStationUUID, secondStationUUID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rev.Revision == 0 {
+		t.Fatalf("combined revision = %+v", rev)
+	}
+
+	page, err := st.ListCatalogPageForStations(ctx, []string{testStationUUID, secondStationUUID}, "all", "", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 2 || page[0].ID != "aaa" || page[1].ID != "bbb" {
+		t.Fatalf("page = %+v", page)
+	}
+	if page[1].CoverURL != "/radio/all/covers/bbb" {
+		t.Fatalf("cover URL = %q", page[1].CoverURL)
+	}
+
+	if _, err := st.AssetForStations(ctx, []string{testStationUUID}, "bbb", "cover"); err != sql.ErrNoRows {
+		t.Fatalf("single-station asset err = %v, want sql.ErrNoRows", err)
+	}
+	asset, err := st.AssetForStations(ctx, []string{testStationUUID, secondStationUUID}, "bbb", "cover")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asset.Path != "/cache/b.jpg" {
+		t.Fatalf("asset = %+v", asset)
 	}
 }
 

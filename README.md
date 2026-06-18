@@ -21,6 +21,7 @@ from disk.
 ## Features
 
 - Per-station live radio timeline shared by listeners of that station.
+- Built-in `/radio/all` station that randomly plays from all configured stations.
 - Background schedule maintenance, even when nobody is listening.
 - Separate media worker for scanner, ffmpeg, cache validation, and explicit
   cover asset copying.
@@ -172,7 +173,7 @@ Supported keys:
 | `data_dir` | `./data` | Root data directory. |
 | `gap_frames` | `209` | Silence frames inserted between tracks. |
 | `log_level` | `DEBUG` | Minimum structured log level for all binaries. |
-| `radios[].alias` | none | Human-readable radio path alias. Lowercase letters, numbers, and hyphens only. |
+| `radios[].alias` | none | Human-readable radio path alias. Lowercase letters, numbers, and hyphens only. `all` is reserved for the built-in aggregate station. |
 | `radios[].uuid` | none | Canonical radio UUID. Worker scans `<worker.inbox_dir>/<uuid>`. |
 | `server.addr` | `:8080` | HTTP listen address for `raydio`. |
 | `server.rate_limit_rps` | `10` | Per-client-IP HTTP request rate limit. `/healthz` is exempt. |
@@ -258,7 +259,7 @@ files are not deleted.
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Browser player. |
-| `GET /api/stations` | Configured station aliases and UUIDs. |
+| `GET /api/stations` | Configured station aliases and UUIDs, plus the built-in `all` aggregate station. |
 | `GET /radio/{uuid-or-alias}` | Infinite MP3 stream for one station. |
 | `GET /radio/{uuid-or-alias}/api/now` | Current server time, slot, track, elapsed time, and duration. |
 | `GET /radio/{uuid-or-alias}/api/events` | Server-Sent Events stream for track changes. |
@@ -328,6 +329,8 @@ Each station scheduler fills future slots ahead of time. The main service radio
 engine keeps these schedules extended while the process is running, even if
 there are no active listeners. Track order uses a shuffle bag. When more than
 one track exists, Raydio avoids choosing the same track for adjacent track slots.
+The built-in `all` station has its own shared schedule and picks uniformly among
+non-empty configured stations before shuffling within the chosen station.
 
 The radio engine loads schedule and catalog snapshots into memory on a fixed
 background interval. Request handlers read those snapshots instead of querying

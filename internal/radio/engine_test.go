@@ -188,6 +188,64 @@ func TestEngineRefreshCachesScheduledAssets(t *testing.T) {
 	}
 }
 
+func TestEngineRefreshUsesAssetRouteForCoverURLs(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	mustUpsertStation(t, ctx, st)
+
+	track := store.Track{
+		ID:            "abcdef1234567890",
+		StationUUID:   testStationUUID,
+		SourcePath:    "/inbox/a.mp3",
+		CachePath:     "/cache/a.mp3",
+		Title:         "A",
+		Artist:        "Artist",
+		DurationMs:    2400,
+		FrameCount:    100,
+		FrameSize:     576,
+		Bitrate:       192000,
+		SampleRate:    48000,
+		Channels:      2,
+		Status:        store.TrackStatusActive,
+		SourceModUnix: 1,
+	}
+	if err := st.UpsertTrack(ctx, track); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertAsset(ctx, store.Asset{TrackID: track.ID, Kind: "cover", Path: "/cache/a.jpg", MIME: "image/jpeg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	e, err := NewEngine(EngineConfig{
+		StationUUID:        testStationUUID,
+		AssetRoute:         "all",
+		Scheduler:          NewScheduler(st, testStationUUID, "/cache/silence.mp3", 5),
+		Store:              st,
+		SilencePath:        "/cache/silence.mp3",
+		RefreshInterval:    time.Minute,
+		StreamChunkWindow:  frameDuration(1),
+		StreamBufferWindow: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(100, 0)
+	if err := e.Refresh(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.updateNow(ctx, now); err != nil {
+		t.Fatal(err)
+	}
+	got := e.Now()
+	if got.Track == nil || got.Track.CoverURL != "/radio/all/covers/"+track.ID {
+		t.Fatalf("now = %+v", got)
+	}
+}
+
 func TestEngineRefreshDoesNotCacheAssetsOutsideSchedule(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "raydio.sqlite"))

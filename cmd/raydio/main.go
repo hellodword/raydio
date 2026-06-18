@@ -71,8 +71,30 @@ type radioConfig struct {
 }
 
 type stationRuntime struct {
-	station radioConfig
-	engine  *radio.Engine
+	station            radioConfig
+	engine             *radio.Engine
+	sourceStationUUIDs []string
+	catalogRoute       string
+}
+
+func (rt *stationRuntime) sourceStations() []string {
+	if rt == nil {
+		return nil
+	}
+	if len(rt.sourceStationUUIDs) != 0 {
+		return rt.sourceStationUUIDs
+	}
+	return []string{rt.station.UUID}
+}
+
+func (rt *stationRuntime) catalogRouteID() string {
+	if rt == nil {
+		return ""
+	}
+	if rt.catalogRoute != "" {
+		return rt.catalogRoute
+	}
+	return rt.station.UUID
 }
 
 type webFile struct {
@@ -88,6 +110,8 @@ const (
 	minStreamChunkWindow  = 120 * time.Millisecond
 	maxStreamChunkWindow  = 2 * time.Second
 	maxStreamBufferWindow = 30 * time.Second
+	aggregateStationAlias = "all"
+	aggregateStationUUID  = "00000000-0000-0000-0000-000000000000"
 )
 
 func main() {
@@ -183,7 +207,8 @@ func run(ctx context.Context, cfg config) error {
 	defer st.Close()
 
 	stations := map[string]*stationRuntime{}
-	stationIDs := make([]string, 0, len(cfg.Radios))
+	stationIDs := make([]string, 0, len(cfg.Radios)+1)
+	sourceStationIDs := make([]string, 0, len(cfg.Radios))
 	for _, r := range cfg.Radios {
 		if err := st.UpsertStation(ctx, store.Station{UUID: r.UUID, Alias: r.Alias, Enabled: true}); err != nil {
 			return err
@@ -204,11 +229,47 @@ func run(ctx context.Context, cfg config) error {
 		if err := engine.Start(ctx); err != nil {
 			return err
 		}
-		rt := &stationRuntime{station: r, engine: engine}
+		rt := &stationRuntime{
+			station:            r,
+			engine:             engine,
+			sourceStationUUIDs: []string{r.UUID},
+			catalogRoute:       r.UUID,
+		}
 		stations[r.UUID] = rt
 		stations[r.Alias] = rt
 		stationIDs = append(stationIDs, r.UUID)
+		sourceStationIDs = append(sourceStationIDs, r.UUID)
 	}
+	aggregate := radioConfig{Alias: aggregateStationAlias, UUID: aggregateStationUUID}
+	if err := st.UpsertStation(ctx, store.Station{UUID: aggregate.UUID, Alias: aggregate.Alias, Enabled: true}); err != nil {
+		return err
+	}
+	aggregateScheduler := radio.NewSchedulerWithSources(st, aggregate.UUID, sourceStationIDs, cfg.GapFrames)
+	aggregateEngine, err := radio.NewEngine(radio.EngineConfig{
+		StationUUID:        aggregate.UUID,
+		AssetRoute:         aggregate.Alias,
+		Scheduler:          aggregateScheduler,
+		Store:              st,
+		SilencePath:        paths.SilencePath(cfg.CacheDir, cfg.GapFrames),
+		RefreshInterval:    cfg.ScheduleInterval,
+		StreamChunkWindow:  cfg.StreamChunkWindow,
+		StreamBufferWindow: cfg.StreamBufferWindow,
+	})
+	if err != nil {
+		return err
+	}
+	if err := aggregateEngine.Start(ctx); err != nil {
+		return err
+	}
+	aggregateRuntime := &stationRuntime{
+		station:            aggregate,
+		engine:             aggregateEngine,
+		sourceStationUUIDs: append([]string(nil), sourceStationIDs...),
+		catalogRoute:       aggregate.Alias,
+	}
+	stations[aggregate.UUID] = aggregateRuntime
+	stations[aggregate.Alias] = aggregateRuntime
+	stationIDs = append(stationIDs, aggregate.UUID)
 	slog.Info("starting raydio", "addr", cfg.Addr, "data_dir", cfg.DataDir, "cache_dir", cfg.CacheDir, "db_path", cfg.DBPath, "radios", len(cfg.Radios), "rate_limit_rps", cfg.RateLimitRPS, "rate_limit_burst", cfg.RateLimitBurst, "max_streams_per_ip", cfg.MaxStreamsPerIP, "max_events_per_ip", cfg.MaxEventsPerIP, "trusted_proxy_cidrs", cfg.TrustedProxyCIDRs, "client_ip_headers", cfg.ClientIPHeaders, "schedule_interval", cfg.ScheduleInterval, "stream_chunk_window", cfg.StreamChunkWindow, "stream_buffer_window", cfg.StreamBufferWindow, "stream_write_timeout", cfg.StreamWriteTimeout, "gap_frames", cfg.GapFrames)
 
 	webFiles, err := loadWebFiles()
@@ -300,6 +361,14 @@ func validateConfig(cfg config) error {
 	}
 	if len(cfg.Radios) == 0 {
 		return fmt.Errorf("at least one radio is required")
+	}
+	for _, r := range cfg.Radios {
+		if r.Alias == aggregateStationAlias {
+			return fmt.Errorf("radio alias %q is reserved for the built-in aggregate station", aggregateStationAlias)
+		}
+		if r.UUID == aggregateStationUUID {
+			return fmt.Errorf("radio uuid %q is reserved for the built-in aggregate station", aggregateStationUUID)
+		}
 	}
 	return nil
 }
@@ -780,7 +849,7 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	rev, err := a.store.CatalogRevision(r.Context(), rt.station.UUID)
+	rev, err := a.store.CatalogRevisionForStations(r.Context(), rt.sourceStations())
 	if err != nil {
 		internalServerError(w, r, "catalog revision failed", err)
 		return
@@ -792,7 +861,7 @@ func (a *app) handleCatalog(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	tracks, err := a.store.ListCatalogPage(r.Context(), rt.station.UUID, afterTitle, afterID, limit+1)
+	tracks, err := a.store.ListCatalogPageForStations(r.Context(), rt.sourceStations(), rt.catalogRouteID(), afterTitle, afterID, limit+1)
 	if err != nil {
 		internalServerError(w, r, "catalog page failed", err)
 		return
@@ -821,11 +890,13 @@ func (a *app) handleAsset(kind string) http.HandlerFunc {
 			return
 		}
 		id := r.PathValue("id")
-		if asset, ok := rt.engine.Asset(id, kind); ok {
-			a.serveAsset(w, r, asset)
-			return
+		if rt.engine != nil {
+			if asset, ok := rt.engine.Asset(id, kind); ok {
+				a.serveAsset(w, r, asset)
+				return
+			}
 		}
-		asset, err := a.store.Asset(r.Context(), rt.station.UUID, id, kind)
+		asset, err := a.store.AssetForStations(r.Context(), rt.sourceStations(), id, kind)
 		if errors.Is(err, sql.ErrNoRows) {
 			http.NotFound(w, r)
 			return
@@ -834,7 +905,9 @@ func (a *app) handleAsset(kind string) http.HandlerFunc {
 			internalServerError(w, r, "asset lookup failed", err)
 			return
 		}
-		rt.engine.RequestRefresh()
+		if rt.engine != nil {
+			rt.engine.RequestRefresh()
+		}
 		a.serveAsset(w, r, asset)
 	}
 }

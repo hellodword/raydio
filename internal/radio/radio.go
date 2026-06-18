@@ -15,22 +15,31 @@ import (
 )
 
 type Scheduler struct {
-	store       *store.Store
-	stationUUID string
-	gapFrames   int64
-	fillAhead   time.Duration
-	mu          sync.Mutex
-	bag         []string
-	lastTrack   string
-	rng         *rand.Rand
-	tracks      trackSet
-	catalogRev  store.CatalogRevision
-	tracksReady bool
+	store              *store.Store
+	stationUUID        string
+	sourceStationUUIDs []string
+	gapFrames          int64
+	fillAhead          time.Duration
+	mu                 sync.Mutex
+	stationBag         []string
+	trackBags          map[string][]string
+	lastTrack          string
+	rng                *rand.Rand
+	tracks             aggregateTrackSet
+	catalogRev         store.CatalogRevision
+	tracksReady        bool
 }
 
 type trackSet struct {
 	byID map[string]store.Track
 	ids  []string
+}
+
+type aggregateTrackSet struct {
+	byID      map[string]store.Track
+	byStation map[string]trackSet
+	stations  []string
+	ids       []string
 }
 
 type Now struct {
@@ -53,12 +62,22 @@ type NowTrack struct {
 }
 
 func NewScheduler(st *store.Store, stationUUID, _ string, gapFrames int64) *Scheduler {
+	return NewSchedulerWithSources(st, stationUUID, []string{stationUUID}, gapFrames)
+}
+
+func NewSchedulerWithSources(st *store.Store, stationUUID string, sourceStationUUIDs []string, gapFrames int64) *Scheduler {
+	sourceStationUUIDs = uniqueNonEmpty(sourceStationUUIDs)
+	if len(sourceStationUUIDs) == 0 && stationUUID != "" {
+		sourceStationUUIDs = []string{stationUUID}
+	}
 	return &Scheduler{
-		store:       st,
-		stationUUID: stationUUID,
-		gapFrames:   gapFrames,
-		fillAhead:   30 * time.Minute,
-		rng:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		store:              st,
+		stationUUID:        stationUUID,
+		sourceStationUUIDs: append([]string(nil), sourceStationUUIDs...),
+		gapFrames:          gapFrames,
+		fillAhead:          30 * time.Minute,
+		trackBags:          map[string][]string{},
+		rng:                rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -115,22 +134,23 @@ func (s *Scheduler) ensureLocked(ctx context.Context, now time.Time) error {
 	return s.store.UpsertSlots(ctx, slots)
 }
 
-func (s *Scheduler) activeTrackSet(ctx context.Context) (trackSet, error) {
-	rev, err := s.store.CatalogRevision(ctx, s.stationUUID)
+func (s *Scheduler) activeTrackSet(ctx context.Context) (aggregateTrackSet, error) {
+	rev, err := s.store.CatalogRevisionForStations(ctx, s.sourceStationUUIDs)
 	if err != nil {
-		return trackSet{}, err
+		return aggregateTrackSet{}, err
 	}
 	if s.tracksReady && rev == s.catalogRev {
 		return s.tracks, nil
 	}
-	tracks, err := s.store.ListActiveTracks(ctx, s.stationUUID)
+	tracks, err := s.store.ListActiveTracksForStations(ctx, s.sourceStationUUIDs)
 	if err != nil {
-		return trackSet{}, err
+		return aggregateTrackSet{}, err
 	}
-	s.tracks = newTrackSet(tracks)
+	s.tracks = newAggregateTrackSet(tracks, s.sourceStationUUIDs)
 	s.catalogRev = rev
 	s.tracksReady = true
-	s.bag = nil
+	s.stationBag = nil
+	s.trackBags = map[string][]string{}
 	return s.tracks, nil
 }
 
@@ -156,26 +176,131 @@ func newTrackSet(tracks []store.Track) trackSet {
 	return trackSet{byID: byID, ids: ids}
 }
 
-func (s *Scheduler) nextTrack(set trackSet) store.Track {
+func newAggregateTrackSet(tracks []store.Track, stationOrder []string) aggregateTrackSet {
+	grouped := map[string][]store.Track{}
+	byID := map[string]store.Track{}
+	ids := make([]string, 0, len(tracks))
+	for _, t := range tracks {
+		grouped[t.StationUUID] = append(grouped[t.StationUUID], t)
+		byID[t.ID] = t
+		ids = append(ids, t.ID)
+	}
+	sort.Strings(ids)
+	out := aggregateTrackSet{
+		byID:      byID,
+		byStation: map[string]trackSet{},
+		ids:       ids,
+	}
+	for _, stationID := range stationOrder {
+		ts := newTrackSet(grouped[stationID])
+		if len(ts.ids) == 0 {
+			continue
+		}
+		out.byStation[stationID] = ts
+		out.stations = append(out.stations, stationID)
+	}
+	return out
+}
+
+func (s *Scheduler) nextTrack(set aggregateTrackSet) store.Track {
 	if len(set.ids) == 1 {
 		s.lastTrack = set.ids[0]
 		return set.byID[set.ids[0]]
 	}
 	for {
-		for len(s.bag) == 0 {
-			s.bag = append([]string(nil), set.ids...)
-			s.rng.Shuffle(len(s.bag), func(i, j int) { s.bag[i], s.bag[j] = s.bag[j], s.bag[i] })
-			if len(s.bag) > 1 && s.bag[0] == s.lastTrack {
-				s.bag[0], s.bag[1] = s.bag[1], s.bag[0]
+		if len(s.stationBag) == 0 {
+			s.stationBag = append([]string(nil), set.stations...)
+			s.rng.Shuffle(len(s.stationBag), func(i, j int) { s.stationBag[i], s.stationBag[j] = s.stationBag[j], s.stationBag[i] })
+			s.movePlayableStationForward(set)
+		}
+		stationID := s.stationBag[0]
+		s.stationBag = s.stationBag[1:]
+		t, ok := s.nextTrackFromStation(set, stationID)
+		if !ok {
+			continue
+		}
+		if t.ID == s.lastTrack {
+			s.stationBag = append(s.stationBag, stationID)
+			continue
+		}
+		s.lastTrack = t.ID
+		return t
+	}
+}
+
+func (s *Scheduler) nextTrackFromStation(set aggregateTrackSet, stationID string) (store.Track, bool) {
+	ts, ok := set.byStation[stationID]
+	if !ok || len(ts.ids) == 0 {
+		return store.Track{}, false
+	}
+	if len(ts.ids) == 1 {
+		return ts.byID[ts.ids[0]], true
+	}
+	if s.trackBags == nil {
+		s.trackBags = map[string][]string{}
+	}
+	bag := s.trackBags[stationID]
+	if len(bag) == 0 {
+		bag = append([]string(nil), ts.ids...)
+		s.rng.Shuffle(len(bag), func(i, j int) { bag[i], bag[j] = bag[j], bag[i] })
+		if len(bag) > 1 && bag[0] == s.lastTrack {
+			for i := 1; i < len(bag); i++ {
+				if bag[i] != s.lastTrack {
+					bag[0], bag[i] = bag[i], bag[0]
+					break
+				}
 			}
 		}
-		id := s.bag[0]
-		s.bag = s.bag[1:]
-		if t, ok := set.byID[id]; ok {
-			s.lastTrack = id
-			return t
+	}
+	for len(bag) > 0 {
+		id := bag[0]
+		bag = bag[1:]
+		s.trackBags[stationID] = bag
+		if t, ok := ts.byID[id]; ok {
+			return t, true
 		}
 	}
+	return store.Track{}, false
+}
+
+func (s *Scheduler) movePlayableStationForward(set aggregateTrackSet) {
+	if len(s.stationBag) <= 1 || s.lastTrack == "" {
+		return
+	}
+	if stationHasTrackOtherThan(set.byStation[s.stationBag[0]], s.lastTrack) {
+		return
+	}
+	for i := 1; i < len(s.stationBag); i++ {
+		if stationHasTrackOtherThan(set.byStation[s.stationBag[i]], s.lastTrack) {
+			s.stationBag[0], s.stationBag[i] = s.stationBag[i], s.stationBag[0]
+			return
+		}
+	}
+}
+
+func stationHasTrackOtherThan(set trackSet, trackID string) bool {
+	for _, id := range set.ids {
+		if id != trackID {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func framesToMs(frames int64) int64 {
