@@ -9,10 +9,10 @@ x-runtime-hardening: &runtime-hardening
     - ALL
   security_opt:
     - no-new-privileges:true
-  restart: unless-stopped
 
 x-raydio-app: &raydio-app
   <<: *runtime-hardening
+  restart: unless-stopped
   volumes:
     - raydio-data:/srv/raydio/data
     - ./config.docker.yaml:/srv/raydio/config.yaml:ro
