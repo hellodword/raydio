@@ -7,9 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 
 	"raydio/internal/paths"
 )
@@ -212,6 +215,53 @@ func TestWorkerScansMP3IntoCache(t *testing.T) {
 	}
 }
 
+func TestRunContinuesAfterInitialCatalogScanFailure(t *testing.T) {
+	oldScanAllFunc := scanAllFunc
+	defer func() { scanAllFunc = oldScanAllFunc }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	layout := paths.New(dir, "")
+	initialErr := errors.New("initial catalog scan failed")
+	var calls atomic.Int64
+	scanAllFunc = func(context.Context, []catalogRuntime) error {
+		calls.Add(1)
+		return initialErr
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, config{
+			DataDir:        dir,
+			InboxDir:       layout.InboxDir,
+			CacheDir:       layout.CacheDir,
+			DBPath:         layout.DBPath,
+			Radios:         []radioConfig{{Alias: "monthly", UUID: testStationUUID, InboxDir: filepath.Join(layout.InboxDir, testStationUUID)}},
+			RescanInterval: time.Hour,
+			GapFrames:      5,
+		})
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("worker exited after initial scan failure: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("initial scan calls = %d, want 1", calls.Load())
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("worker did not stop after context cancellation")
+	}
+}
+
 func TestWatchAndScanDebouncesEventsAndWatchesNewDirectories(t *testing.T) {
 	oldDebounce := watchDebounce
 	watchDebounce = 25 * time.Millisecond
@@ -265,6 +315,30 @@ func TestWatchAndScanDebouncesEventsAndWatchesNewDirectories(t *testing.T) {
 	}
 }
 
+func TestWatchLoopReturnsErrorWhenEventsChannelCloses(t *testing.T) {
+	events := make(chan fsnotify.Event)
+	close(events)
+	errs := make(chan error)
+	err := watchLoop(context.Background(), time.Hour, nil, func(context.Context, catalogRuntime) error {
+		return nil
+	}, noopWatcher{}, events, errs, map[string]struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "events channel closed") {
+		t.Fatalf("error = %v, want events channel closed", err)
+	}
+}
+
+func TestWatchLoopReturnsErrorWhenErrorsChannelCloses(t *testing.T) {
+	events := make(chan fsnotify.Event)
+	errs := make(chan error)
+	close(errs)
+	err := watchLoop(context.Background(), time.Hour, nil, func(context.Context, catalogRuntime) error {
+		return nil
+	}, noopWatcher{}, events, errs, map[string]struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "errors channel closed") {
+		t.Fatalf("error = %v, want errors channel closed", err)
+	}
+}
+
 func TestIgnoredPathFiltersHiddenTempAndPartialFiles(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "inbox")
 	if ignoredPath(root, filepath.Join(root, "song.mp3")) {
@@ -307,6 +381,12 @@ func TestCleanupStaleTempFiles(t *testing.T) {
 			t.Fatalf("%s missing: %v", path, err)
 		}
 	}
+}
+
+type noopWatcher struct{}
+
+func (noopWatcher) Add(string) error {
+	return nil
 }
 
 func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {

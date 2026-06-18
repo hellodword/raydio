@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"raydio/internal/suno"
 )
 
 const testStationUUID = "00000000-0000-0000-0000-000000000001"
@@ -77,5 +82,63 @@ radios:
 	}
 	if cfg.Radios[0].InboxDir != filepath.Join("/srv/inbox", testStationUUID) {
 		t.Fatalf("Radio inbox = %q", cfg.Radios[0].InboxDir)
+	}
+}
+
+func TestRunContinuesAfterInitialSyncFailure(t *testing.T) {
+	oldSyncAllFunc := syncAllFunc
+	defer func() { syncAllFunc = oldSyncAllFunc }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	initialErr := errors.New("initial sync failed")
+	var calls atomic.Int64
+	syncAllFunc = func(ctx context.Context, _ *suno.Syncer, _ []radioConfig) error {
+		if calls.Add(1) == 1 {
+			return initialErr
+		}
+		cancel()
+		return context.Canceled
+	}
+
+	err := run(ctx, config{
+		Radios:        []radioConfig{{Alias: "monthly", UUID: testStationUUID, InboxDir: filepath.Join(t.TempDir(), testStationUUID)}},
+		SyncInterval:  5 * time.Millisecond,
+		HTTPTimeout:   time.Second,
+		MaxAudioBytes: 1,
+		MaxCoverBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("sync calls = %d, want retry after initial failure", calls.Load())
+	}
+}
+
+func TestRunStopsCleanlyWhenInitialSyncIsCanceled(t *testing.T) {
+	oldSyncAllFunc := syncAllFunc
+	defer func() { syncAllFunc = oldSyncAllFunc }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var calls atomic.Int64
+	syncAllFunc = func(context.Context, *suno.Syncer, []radioConfig) error {
+		calls.Add(1)
+		return context.Canceled
+	}
+
+	err := run(ctx, config{
+		Radios:        []radioConfig{{Alias: "monthly", UUID: testStationUUID, InboxDir: filepath.Join(t.TempDir(), testStationUUID)}},
+		SyncInterval:  time.Second,
+		HTTPTimeout:   time.Second,
+		MaxAudioBytes: 1,
+		MaxCoverBytes: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("sync calls = %d, want 1", calls.Load())
 	}
 }

@@ -143,8 +143,11 @@ func run(ctx context.Context, cfg config) error {
 			}, st),
 		})
 	}
-	if err := scanAll(ctx, cats); err != nil {
-		return err
+	if err := scanAllFunc(ctx, cats); err != nil {
+		if isShutdownErr(ctx, err) {
+			return nil
+		}
+		slog.Error("initial catalog scan failed", "error", err)
 	}
 	return watchAndScan(ctx, cfg.RescanInterval, cats, scan)
 }
@@ -187,6 +190,14 @@ func watchAndScan(ctx context.Context, interval time.Duration, cats []catalogRun
 		}
 	}
 
+	return watchLoop(ctx, interval, cats, scanFn, watcher, watcher.Events, watcher.Errors, watched)
+}
+
+type watcherAdder interface {
+	Add(string) error
+}
+
+func watchLoop(ctx context.Context, interval time.Duration, cats []catalogRuntime, scanFn scannerFunc, watcher watcherAdder, events <-chan fsnotify.Event, errs <-chan error, watched map[string]struct{}) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	scanReq := make(chan string, maxInt(4, len(cats)*4))
@@ -217,9 +228,12 @@ func watchAndScan(ctx context.Context, interval time.Duration, cats []catalogRun
 		select {
 		case <-ctx.Done():
 			return nil
-		case event, ok := <-watcher.Events:
+		case event, ok := <-events:
 			if !ok {
-				return nil
+				if ctx.Err() != nil {
+					return nil
+				}
+				return errors.New("catalog watcher events channel closed")
 			}
 			cat, ok := stationForPath(cats, event.Name)
 			if !ok || ignoredPath(cat.inbox, event.Name) {
@@ -235,15 +249,18 @@ func watchAndScan(ctx context.Context, interval time.Duration, cats []catalogRun
 			if event.Has(fsnotify.Create) || event.Has(fsnotify.Write) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Remove) {
 				schedule(cat.uuid)
 			}
-		case err, ok := <-watcher.Errors:
+		case err, ok := <-errs:
 			if !ok {
-				return nil
+				if ctx.Err() != nil {
+					return nil
+				}
+				return errors.New("catalog watcher errors channel closed")
 			}
 			slog.Warn("catalog watcher error", "error", err)
 		case <-ticker.C:
 			slog.Debug("catalog scan tick")
-			if err := scanAll(ctx, cats); err != nil {
-				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			if err := scanAllFunc(ctx, cats); err != nil {
+				if isShutdownErr(ctx, err) {
 					return nil
 				}
 				slog.Error("catalog scan failed", "error", err)
@@ -254,13 +271,19 @@ func watchAndScan(ctx context.Context, interval time.Duration, cats []catalogRun
 				continue
 			}
 			if err := scanFn(ctx, cat); err != nil {
-				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+				if isShutdownErr(ctx, err) {
 					return nil
 				}
 				slog.Error("catalog scan failed", "radio", cat.alias, "uuid", cat.uuid, "error", err)
 			}
 		}
 	}
+}
+
+var scanAllFunc = scanAll
+
+func isShutdownErr(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
 }
 
 func scanAll(ctx context.Context, cats []catalogRuntime) error {
@@ -275,7 +298,7 @@ func scanAll(ctx context.Context, cats []catalogRuntime) error {
 	return g.Wait()
 }
 
-func watchTree(watcher *fsnotify.Watcher, watched map[string]struct{}, root string) error {
+func watchTree(watcher watcherAdder, watched map[string]struct{}, root string) error {
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}

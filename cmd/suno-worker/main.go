@@ -115,8 +115,11 @@ func run(ctx context.Context, cfg config) error {
 	syncer := suno.NewSyncer(client, slog.Default())
 	syncer.SetDownloadLimits(cfg.MaxAudioBytes, cfg.MaxCoverBytes)
 	slog.Info("starting suno-worker", "data_dir", cfg.DataDir, "inbox_dir", cfg.InboxDir, "radios", len(cfg.Radios), "sync_interval", cfg.SyncInterval, "http_timeout", cfg.HTTPTimeout, "max_audio_bytes", cfg.MaxAudioBytes, "max_cover_bytes", cfg.MaxCoverBytes)
-	if err := syncAll(ctx, syncer, cfg.Radios); err != nil {
-		return err
+	if err := syncAllFunc(ctx, syncer, cfg.Radios); err != nil {
+		if isShutdownErr(ctx, err) {
+			return nil
+		}
+		slog.Error("initial suno sync failed", "error", err)
 	}
 	ticker := time.NewTicker(cfg.SyncInterval)
 	defer ticker.Stop()
@@ -125,8 +128,8 @@ func run(ctx context.Context, cfg config) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := syncAll(ctx, syncer, cfg.Radios); err != nil {
-				if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			if err := syncAllFunc(ctx, syncer, cfg.Radios); err != nil {
+				if isShutdownErr(ctx, err) {
 					return nil
 				}
 				slog.Error("suno sync failed", "error", err)
@@ -152,6 +155,12 @@ func validateConfig(cfg config) error {
 		return fmt.Errorf("at least one radio is required")
 	}
 	return nil
+}
+
+var syncAllFunc = syncAll
+
+func isShutdownErr(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled)
 }
 
 func syncAll(ctx context.Context, syncer *suno.Syncer, radios []radioConfig) error {
