@@ -3,3 +3,6 @@ tmp
 data
 config.yaml
 *.tar.gz
+AGENTS.md
+.agents
+.vscode
