@@ -267,6 +267,11 @@ files are not deleted.
 | `GET /radio/{uuid-or-alias}/covers/{trackID}` | Cover asset for a track, when present. |
 | `GET /healthz` | Plain `ok` health check. |
 
+The browser player lists `all` first and selects it by default. Use
+`/?raydio=<alias-or-uuid>` to open a specific station; a missing or unknown
+`raydio` value is normalized to `/?raydio=all` while preserving other query
+parameters.
+
 `/radio/{uuid-or-alias}/api/catalog` is paginated. Use `limit` to request up to
 500 tracks and pass the returned `nextCursor` as `cursor` to read the next page.
 Responses include `revision`, `tracks`, `nextCursor`, and `hasMore`, and support

@@ -42,9 +42,37 @@ audio.addEventListener("pause", updatePlayButton);
 audio.addEventListener("ended", updatePlayButton);
 
 stationSelect.addEventListener("change", () => {
-  const station = stations.find((item) => item.alias === stationSelect.value || item.uuid === stationSelect.value);
+  const station = findStation(stationSelect.value);
   if (station) setStation(station);
 });
+
+function stationIdentifier(station) {
+  if (typeof station?.alias === "string" && station.alias) return station.alias;
+  if (typeof station?.uuid === "string" && station.uuid) return station.uuid;
+  return "";
+}
+
+function findStation(identifier) {
+  if (!identifier) return null;
+  return stations.find((item) => item.alias === identifier || item.uuid === identifier) || null;
+}
+
+function syncStationQuery(station) {
+  const identifier = stationIdentifier(station);
+  if (!identifier) return;
+
+  const url = new URL(window.location.href);
+  const currentValues = url.searchParams.getAll("raydio");
+  if (
+    currentValues.length === 1 &&
+    (currentValues[0] === station.alias || currentValues[0] === station.uuid)
+  ) {
+    return;
+  }
+
+  url.searchParams.set("raydio", identifier);
+  window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+}
 
 function stationPath() {
   if (!currentStation) return "";
@@ -158,12 +186,18 @@ async function loadStations() {
   const res = await fetch("/api/stations", { cache: "no-store" });
   if (!res.ok) throw new Error(`stations ${res.status}`);
   const body = await res.json();
-  stations = Array.isArray(body.stations) ? body.stations : [];
+  stations = (Array.isArray(body.stations) ? body.stations : []).filter(
+    (station) => station && typeof station === "object" && stationIdentifier(station),
+  );
+  const aggregateIndex = stations.findIndex((station) => station.alias === "all");
+  if (aggregateIndex > 0) {
+    stations.unshift(stations.splice(aggregateIndex, 1)[0]);
+  }
   stationSelect.replaceChildren(
     ...stations.map((station) => {
       const option = document.createElement("option");
-      option.value = station.alias || station.uuid;
-      option.textContent = station.alias || station.uuid;
+      option.value = stationIdentifier(station);
+      option.textContent = stationIdentifier(station);
       return option;
     }),
   );
@@ -171,12 +205,19 @@ async function loadStations() {
     statusText.textContent = "no station";
     return;
   }
-  setStation(stations[0]);
+  const requestedStation = new URL(window.location.href).searchParams.get("raydio");
+  const station = findStation(requestedStation) || findStation("all");
+  if (!station) {
+    statusText.textContent = "no station";
+    return;
+  }
+  setStation(station);
 }
 
 function setStation(station) {
   currentStation = station;
-  stationSelect.value = station.alias || station.uuid;
+  stationSelect.value = stationIdentifier(station);
+  syncStationQuery(station);
   if (events) {
     events.close();
     events = null;
