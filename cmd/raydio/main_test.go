@@ -837,12 +837,48 @@ func TestServeWebFileUsesPreloadedBytesAndETag(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "<!doctype html>") {
 		t.Fatalf("unexpected body prefix: %.40q", rr.Body.String())
 	}
-	config, ok := files["config.js"]
+	config, ok := files["config.json"]
 	if !ok {
 		t.Fatal("default API config is not preloaded")
 	}
 	if !strings.Contains(string(config.Data), `"apiBaseUrl":""`) {
 		t.Fatalf("unexpected default API config: %q", config.Data)
+	}
+	configReq := httptest.NewRequest(http.MethodGet, "/config.json", nil)
+	configRR := httptest.NewRecorder()
+	a.serveWebFile(configRR, configReq, "config.json", "application/json; charset=utf-8")
+	if got := configRR.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("config Cache-Control = %q, want no-store", got)
+	}
+	if got := configRR.Header().Get("ETag"); got != "" {
+		t.Fatalf("config ETag = %q, want empty", got)
+	}
+}
+
+func TestConfigJSONRouteReplacesConfigJavaScript(t *testing.T) {
+	files, err := loadWebFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &app{webFiles: files}
+	mux := http.NewServeMux()
+	a.routes(mux)
+
+	configReq := httptest.NewRequest(http.MethodGet, "/config.json", nil)
+	configRR := httptest.NewRecorder()
+	mux.ServeHTTP(configRR, configReq)
+	if configRR.Code != http.StatusOK {
+		t.Fatalf("config.json status = %d, want 200", configRR.Code)
+	}
+	if got := configRR.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("config.json Content-Type = %q", got)
+	}
+
+	legacyReq := httptest.NewRequest(http.MethodGet, "/config.js", nil)
+	legacyRR := httptest.NewRecorder()
+	mux.ServeHTTP(legacyRR, legacyReq)
+	if legacyRR.Code != http.StatusNotFound {
+		t.Fatalf("config.js status = %d, want 404", legacyRR.Code)
 	}
 }
 

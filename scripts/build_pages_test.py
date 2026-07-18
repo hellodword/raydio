@@ -49,15 +49,15 @@ class BuildPagesTest(unittest.TestCase):
 
             self.assertEqual(
                 {path.name for path in output.iterdir()},
-                {"index.html", "app.js", "styles.css", "config.js"},
+                {"index.html", "app.js", "styles.css", "config.json"},
             )
             self.assertEqual(
-                (output / "config.js").read_text(encoding="utf-8"),
-                'globalThis.RAYDIO_CONFIG = Object.freeze({"apiBaseUrl":"https://api.example.test/raydio"});\n',
+                (output / "config.json").read_text(encoding="utf-8"),
+                '{"apiBaseUrl":"https://api.example.test/raydio"}\n',
             )
             index = (output / "index.html").read_text(encoding="utf-8")
             self.assertIn('href="./styles.css"', index)
-            self.assertIn('src="./config.js"', index)
+            self.assertNotIn("config.js", index)
             self.assertIn('src="./app.js"', index)
 
     def test_refuses_to_overwrite_an_existing_output(self) -> None:

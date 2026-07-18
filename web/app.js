@@ -9,68 +9,131 @@ const coverFallback = document.getElementById("coverFallback");
 const streamUrl = document.getElementById("streamUrl");
 const streamCommand = document.getElementById("streamCommand");
 const copyStatus = document.getElementById("copyStatus");
-const apiBaseURL = configuredAPIBaseURL();
 
+const MAX_BASE_URL_LENGTH = 2048;
+const REQUEST_TIMEOUT_MS = 10000;
+const RECOVERY_RETRY_DELAYS_MS = [2000, 5000, 10000, 30000];
+
+let apiBaseURL = "";
 let currentNow = null;
 let stations = [];
 let currentStation = null;
 let events = null;
+let desiredPlaying = false;
+let playbackBlocked = false;
+let recoveryMode = null;
+let recoveryTimer = null;
+let recoveryRunning = false;
+let recoveryFailures = 0;
+let configRequestSequence = 0;
 
-function configuredAPIBaseURL() {
-  const value = globalThis.RAYDIO_CONFIG?.apiBaseUrl;
-  if (typeof value !== "string" || !value) return "";
+function normalizeAPIBaseURL(value) {
+  if (
+    typeof value !== "string" ||
+    value.length > MAX_BASE_URL_LENGTH ||
+    value !== value.trim() ||
+    /[\s\\"'<>]/u.test(value)
+  ) {
+    throw new Error("invalid API base URL");
+  }
+  if (!value) return "";
+  if (!/^https:\/\/[^/]/iu.test(value)) throw new Error("invalid API base URL");
   try {
     const url = new URL(value);
     if (
       url.protocol !== "https:" ||
+      !url.hostname ||
       url.username ||
       url.password ||
       url.search ||
       url.hash
     ) {
-      return "";
+      throw new Error("invalid API base URL");
     }
     return url.toString().replace(/\/$/, "");
   } catch (_err) {
-    return "";
+    throw new Error("invalid API base URL");
   }
 }
 
-function apiURL(path) {
-  if (!apiBaseURL) return path;
-  return new URL(String(path).replace(/^\/+/, ""), `${apiBaseURL}/`).toString();
+function parseRuntimeConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid runtime config");
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== 1 || keys[0] !== "apiBaseUrl") {
+    throw new Error("invalid runtime config");
+  }
+  return normalizeAPIBaseURL(value.apiBaseUrl);
+}
+
+function apiURL(path, baseURL = apiBaseURL) {
+  if (!baseURL) return path;
+  return new URL(String(path).replace(/^\/+/, ""), `${baseURL}/`).toString();
+}
+
+function runtimeConfigURL() {
+  const url = new URL("./config.json", document.baseURI || window.location.href);
+  configRequestSequence += 1;
+  url.searchParams.set("request", `${Date.now()}-${configRequestSequence}`);
+  return url.toString();
+}
+
+async function fetchWithTimeout(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchRuntimeConfig() {
+  const res = await fetchWithTimeout(runtimeConfigURL(), { cache: "no-store" });
+  if (!res.ok) throw new Error(`config ${res.status}`);
+  return parseRuntimeConfig(await res.json());
 }
 
 playButton.addEventListener("click", async () => {
+  if (desiredPlaying) {
+    stopAudio("stopped");
+    return;
+  }
   if (!currentStation) {
     statusText.textContent = "no station";
     return;
   }
-  if (!audio.paused) {
-    stopAudio("stopped");
-    return;
-  }
-  try {
-    statusText.textContent = "playing";
-    await audio.play();
-    updatePlayButton();
-  } catch (err) {
-    statusText.textContent = "play blocked";
-    updatePlayButton();
-  }
+  desiredPlaying = true;
+  playbackBlocked = false;
+  updatePlayButton();
+  await playAudio();
 });
 
 bindCopyBox(streamUrl);
 bindCopyBox(streamCommand);
 
-audio.addEventListener("play", updatePlayButton);
+audio.addEventListener("play", () => {
+  desiredPlaying = true;
+  playbackBlocked = false;
+  updatePlayButton();
+  syncRuntimeStatus();
+});
 audio.addEventListener("pause", updatePlayButton);
-audio.addEventListener("ended", updatePlayButton);
+audio.addEventListener("ended", () => {
+  updatePlayButton();
+  if (desiredPlaying) requestRecovery("active");
+});
+audio.addEventListener("error", () => {
+  if (desiredPlaying) requestRecovery("active");
+});
 
 stationSelect.addEventListener("change", () => {
   const station = findStation(stationSelect.value);
   if (station) setStation(station);
 });
+
+window.addEventListener("online", retryRecoveryNow);
 
 function stationIdentifier(station) {
   if (typeof station?.alias === "string" && station.alias) return station.alias;
@@ -78,9 +141,21 @@ function stationIdentifier(station) {
   return "";
 }
 
-function findStation(identifier) {
+function findStation(identifier, candidates = stations) {
   if (!identifier) return null;
-  return stations.find((item) => item.alias === identifier || item.uuid === identifier) || null;
+  return (
+    candidates.find((item) => item.alias === identifier || item.uuid === identifier) || null
+  );
+}
+
+function preferredStation(candidates) {
+  const requested = new URL(window.location.href).searchParams.get("raydio");
+  const identifiers = [requested, currentStation?.alias, currentStation?.uuid];
+  for (const identifier of identifiers) {
+    const station = findStation(identifier, candidates);
+    if (station) return station;
+  }
+  return findStation("all", candidates);
 }
 
 function syncStationQuery(station) {
@@ -132,12 +207,40 @@ function setArtist(handle, linkable = true) {
   }
 }
 
+function runtimeStatus() {
+  if (recoveryMode) return "reconnecting";
+  if (!currentStation) return "no station";
+  if (playbackBlocked) return "play blocked";
+  return desiredPlaying && !audio.paused ? "playing" : "ready";
+}
+
+function syncRuntimeStatus() {
+  statusText.textContent = runtimeStatus();
+}
+
 function updatePlayButton() {
-  playButton.textContent = audio.paused ? "播放" : "停止";
-  playButton.setAttribute("aria-pressed", String(!audio.paused));
+  playButton.textContent = desiredPlaying ? "停止" : "播放";
+  playButton.setAttribute("aria-pressed", String(desiredPlaying));
+}
+
+async function playAudio() {
+  statusText.textContent = "playing";
+  try {
+    await audio.play();
+    updatePlayButton();
+    return true;
+  } catch (_err) {
+    desiredPlaying = false;
+    playbackBlocked = true;
+    statusText.textContent = "play blocked";
+    updatePlayButton();
+    return false;
+  }
 }
 
 function stopAudio(status) {
+  desiredPlaying = false;
+  playbackBlocked = false;
   audio.pause();
   statusText.textContent = status;
   updatePlayButton();
@@ -167,7 +270,7 @@ async function copyBoxText(element) {
   try {
     await copyText(text);
     copyStatus.textContent = "copied";
-  } catch (err) {
+  } catch (_err) {
     copyStatus.textContent = "copy failed";
   } finally {
     selectElementText(element);
@@ -187,7 +290,7 @@ async function copyText(text) {
     try {
       await navigator.clipboard.writeText(text);
       return;
-    } catch (err) {
+    } catch (_err) {
       fallbackCopyText(text);
       return;
     }
@@ -208,60 +311,91 @@ function fallbackCopyText(text) {
   if (!copied) throw new Error("copy failed");
 }
 
-async function loadStations() {
-  const res = await fetch(apiURL("/api/stations"), { cache: "no-store" });
+async function fetchStations(baseURL) {
+  const res = await fetchWithTimeout(apiURL("/api/stations", baseURL), { cache: "no-store" });
   if (!res.ok) throw new Error(`stations ${res.status}`);
   const body = await res.json();
-  stations = (Array.isArray(body.stations) ? body.stations : []).filter(
+  const nextStations = (Array.isArray(body.stations) ? body.stations : []).filter(
     (station) => station && typeof station === "object" && stationIdentifier(station),
   );
-  const aggregateIndex = stations.findIndex((station) => station.alias === "all");
+  const aggregateIndex = nextStations.findIndex((station) => station.alias === "all");
   if (aggregateIndex > 0) {
-    stations.unshift(stations.splice(aggregateIndex, 1)[0]);
+    nextStations.unshift(nextStations.splice(aggregateIndex, 1)[0]);
   }
+  return nextStations;
+}
+
+function renderStations(nextStations) {
   stationSelect.replaceChildren(
-    ...stations.map((station) => {
+    ...nextStations.map((station) => {
       const option = document.createElement("option");
       option.value = stationIdentifier(station);
       option.textContent = stationIdentifier(station);
       return option;
     }),
   );
-  if (stations.length === 0) {
-    statusText.textContent = "no station";
-    return;
-  }
-  const requestedStation = new URL(window.location.href).searchParams.get("raydio");
-  const station = findStation(requestedStation) || findStation("all");
-  if (!station) {
-    statusText.textContent = "no station";
-    return;
-  }
-  setStation(station);
 }
 
-function setStation(station) {
+async function activateBaseURL(nextBaseURL, preservePlayback) {
+  const nextStations = await fetchStations(nextBaseURL);
+  const station = preferredStation(nextStations);
+  const shouldResume = preservePlayback && desiredPlaying;
+
+  apiBaseURL = nextBaseURL;
+  stations = nextStations;
+  renderStations(stations);
+
+  if (!station) {
+    if (events) events.close();
+    events = null;
+    currentStation = null;
+    desiredPlaying = false;
+    playbackBlocked = false;
+    stationSelect.value = "";
+    audio.pause();
+    audio.removeAttribute("src");
+    resetTrackState();
+    statusText.textContent = "no station";
+    updatePlayButton();
+    return;
+  }
+
+  await setStation(station, { preservePlayback, resumePlayback: shouldResume });
+}
+
+async function setStation(station, options = {}) {
+  const preservePlayback = Boolean(options.preservePlayback);
+  const resumePlayback = preservePlayback && Boolean(options.resumePlayback) && desiredPlaying;
+  if (!preservePlayback) desiredPlaying = false;
+  playbackBlocked = false;
+
   currentStation = station;
   stationSelect.value = stationIdentifier(station);
   syncStationQuery(station);
-  if (events) {
-    events.close();
-    events = null;
-  }
-  stopAudio("ready");
+  if (events) events.close();
+  events = null;
+  audio.pause();
   audio.src = apiURL(stationPath());
   resetTrackState();
-  statusText.textContent = "ready";
-  loadNow().catch(() => {
-    statusText.textContent = "offline";
-  });
+  syncRuntimeStatus();
+  refreshNow();
   connectEvents();
+
+  if (resumePlayback) await playAudio();
+  else updatePlayButton();
 }
 
-async function loadNow() {
-  const res = await fetch(apiURL(`${stationPath()}/api/now`), { cache: "no-store" });
-  if (!res.ok) throw new Error(`now ${res.status}`);
-  renderNow(await res.json());
+async function refreshNow() {
+  try {
+    const res = await fetchWithTimeout(apiURL(`${stationPath()}/api/now`), {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`now ${res.status}`);
+    renderNow(await res.json());
+    finishPassiveRecovery();
+  } catch (_err) {
+    requestRecovery("passive");
+  }
 }
 
 function resetTrackState() {
@@ -282,13 +416,13 @@ function renderNow(now) {
     setArtist("No active track", false);
     cover.style.display = "none";
     coverFallback.style.display = "grid";
-    statusText.textContent = audio.paused ? "ready" : "playing";
+    syncRuntimeStatus();
     return;
   }
 
   title.textContent = now.track.title || "Unknown title";
   setArtist(now.track.artist || "Unknown artist", Boolean(now.track.artist));
-  statusText.textContent = audio.paused ? "ready" : "playing";
+  syncRuntimeStatus();
 
   if (now.track.coverUrl) {
     cover.src = `${apiURL(now.track.coverUrl)}?v=${encodeURIComponent(now.track.id)}`;
@@ -302,20 +436,99 @@ function renderNow(now) {
 }
 
 function connectEvents() {
-  events = new EventSource(apiURL(`${stationPath()}/api/events`));
-  events.addEventListener("now", (ev) => renderNow(JSON.parse(ev.data)));
-  events.addEventListener("open", () => {
-    statusText.textContent = audio.paused ? "ready" : "playing";
+  const source = new EventSource(apiURL(`${stationPath()}/api/events`));
+  events = source;
+  source.addEventListener("now", (ev) => {
+    if (events !== source) return;
+    try {
+      renderNow(JSON.parse(ev.data));
+      finishPassiveRecovery();
+    } catch (_err) {
+      requestRecovery("passive");
+    }
   });
-  events.addEventListener("error", () => {
-    statusText.textContent = "reconnecting";
+  source.addEventListener("open", () => {
+    if (events !== source) return;
+    finishPassiveRecovery();
+    syncRuntimeStatus();
+  });
+  source.addEventListener("error", () => {
+    if (events !== source) return;
+    requestRecovery("passive");
   });
 }
 
-updateCommand();
-updatePlayButton();
+function requestRecovery(mode) {
+  if (mode === "active" || recoveryMode === null) recoveryMode = mode;
+  statusText.textContent = "reconnecting";
+  if (!recoveryRunning && recoveryTimer === null) scheduleRecovery(0);
+}
 
-loadStations().catch(() => {
-  statusText.textContent = "offline";
+function scheduleRecovery(delay) {
+  if (!recoveryMode || recoveryTimer !== null) return;
+  recoveryTimer = setTimeout(runRecovery, delay);
+}
+
+function nextRecoveryDelay() {
+  const index = Math.min(recoveryFailures, RECOVERY_RETRY_DELAYS_MS.length - 1);
+  recoveryFailures += 1;
+  return RECOVERY_RETRY_DELAYS_MS[index];
+}
+
+async function runRecovery() {
+  recoveryTimer = null;
+  if (!recoveryMode || recoveryRunning) return;
+  recoveryRunning = true;
+  let recovered = false;
+  try {
+    const nextBaseURL = await fetchRuntimeConfig();
+    if (!recoveryMode) return;
+    if (nextBaseURL !== apiBaseURL || recoveryMode === "active") {
+      await activateBaseURL(nextBaseURL, true);
+      recovered = true;
+    }
+  } catch (_err) {
+    recovered = false;
+  } finally {
+    recoveryRunning = false;
+    if (recovered) {
+      stopRecovery();
+      syncRuntimeStatus();
+    } else if (recoveryMode && recoveryTimer === null) {
+      scheduleRecovery(nextRecoveryDelay());
+    }
+  }
+}
+
+function finishPassiveRecovery() {
+  if (recoveryMode !== "passive") return;
+  stopRecovery();
+  syncRuntimeStatus();
+}
+
+function stopRecovery() {
+  recoveryMode = null;
+  recoveryFailures = 0;
+  if (recoveryTimer !== null) clearTimeout(recoveryTimer);
+  recoveryTimer = null;
+}
+
+function retryRecoveryNow() {
+  if (!recoveryMode || recoveryRunning) return;
+  if (recoveryTimer !== null) clearTimeout(recoveryTimer);
+  recoveryTimer = null;
+  scheduleRecovery(0);
+}
+
+async function startPlayer() {
+  updateCommand();
   updatePlayButton();
-});
+  try {
+    const initialBaseURL = await fetchRuntimeConfig();
+    await activateBaseURL(initialBaseURL, false);
+  } catch (_err) {
+    requestRecovery("active");
+  }
+}
+
+startPlayer();

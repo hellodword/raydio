@@ -375,7 +375,7 @@ func validateConfig(cfg config) error {
 
 func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", a.handleIndex)
-	mux.HandleFunc("GET /config.js", a.static("config.js", "application/javascript; charset=utf-8"))
+	mux.HandleFunc("GET /config.json", a.static("config.json", "application/json; charset=utf-8"))
 	mux.HandleFunc("GET /app.js", a.static("app.js", "application/javascript; charset=utf-8"))
 	mux.HandleFunc("GET /styles.css", a.static("styles.css", "text/css; charset=utf-8"))
 	mux.HandleFunc("GET /api/stations", a.handleStations)
@@ -411,8 +411,12 @@ func (a *app) serveWebFile(w http.ResponseWriter, r *http.Request, name, content
 		f.ContentType = contentType
 	}
 	w.Header().Set("Content-Type", f.ContentType)
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	w.Header().Set("ETag", f.ETag)
+	if name == "config.json" {
+		w.Header().Set("Cache-Control", "no-store")
+	} else {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Header().Set("ETag", f.ETag)
+	}
 	http.ServeContent(w, r, name, f.ModTime, bytes.NewReader(f.Data))
 }
 
@@ -968,10 +972,10 @@ func internalServerError(w http.ResponseWriter, r *http.Request, msg string, err
 
 func loadWebFiles() (map[string]webFile, error) {
 	files := map[string]string{
-		"index.html": "text/html; charset=utf-8",
-		"config.js":  "application/javascript; charset=utf-8",
-		"app.js":     "application/javascript; charset=utf-8",
-		"styles.css": "text/css; charset=utf-8",
+		"index.html":  "text/html; charset=utf-8",
+		"config.json": "application/json; charset=utf-8",
+		"app.js":      "application/javascript; charset=utf-8",
+		"styles.css":  "text/css; charset=utf-8",
 	}
 	out := make(map[string]webFile, len(files))
 	for name, contentType := range files {

@@ -71,8 +71,8 @@ def build_pages(source: Path, output: Path, raw_base_url: str) -> str:
             ensure_ascii=True,
             separators=(",", ":"),
         )
-        (output / "config.js").write_text(
-            f"globalThis.RAYDIO_CONFIG = Object.freeze({config});\n",
+        (output / "config.json").write_text(
+            f"{config}\n",
             encoding="utf-8",
         )
     except Exception:

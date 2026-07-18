@@ -155,8 +155,8 @@ https://example.com/raydio
 ```
 
 `base_url` must be a public HTTPS URL without credentials, a query, or a
-fragment. A path prefix and port are supported. The value is embedded in the
-public static site and must not contain a secret.
+fragment. A path prefix and port are supported. The value is written to the
+public `config.json` file and must not contain a secret.
 
 The Pages assets use relative paths, so both account sites such as
 `https://foo.github.io/` and project sites such as
@@ -164,6 +164,20 @@ The Pages assets use relative paths, so both account sites such as
 frontend. The station query remains on the Pages URL, while all runtime
 requests and copied stream commands use `base_url`. Opening the player directly
 from the Raydio server continues to use the server's own origin.
+
+The player requests `config.json` without using the browser cache. If the API,
+Server-Sent Events, or an active audio stream fails, it immediately checks the
+file again and then retries after 2, 5, 10, and at most 30 seconds until a
+working base URL is available. A changed URL is adopted only after its
+`/api/stations` endpoint responds successfully. The current station is kept and
+active playback resumes automatically when browser policy permits it; otherwise
+the player reports `play blocked`. Stopping playback during recovery cancels
+automatic resume. Healthy players do not poll the file.
+
+After a tunnel URL changes, run the workflow again with the new value. Already
+open players recover once GitHub Pages serves the new deployment. The former
+`config.js` file and `globalThis.RAYDIO_CONFIG` contract have been removed;
+consumers must read the `{"apiBaseUrl":"..."}` JSON object instead.
 
 ## Command-Line Flags
 
@@ -286,6 +300,7 @@ files are not deleted.
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Browser player. |
+| `GET /config.json` | Uncached browser runtime config; an empty `apiBaseUrl` selects the server's own origin. |
 | `GET /api/stations` | Configured station aliases and UUIDs, plus the built-in `all` aggregate station. |
 | `GET /radio/{uuid-or-alias}` | Infinite MP3 stream for one station. |
 | `GET /radio/{uuid-or-alias}/api/now` | Current server time, slot, track, elapsed time, and duration. |
