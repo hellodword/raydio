@@ -55,6 +55,7 @@ services:
   cloudflared:
     <<: *runtime-hardening
     image: cloudflare/cloudflared:latest
+    restart: unless-stopped
     command: ["tunnel", "--no-autoupdate", "--url", "http://raydio:8080"]
     depends_on:
       - raydio
