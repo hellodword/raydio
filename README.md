@@ -28,6 +28,7 @@ from disk.
 - Infinite `audio/mpeg` streams at `GET /radio/<uuid-or-alias>`.
 - Browser player at `GET /` with play, pause, volume, current track, cover, and
   status display.
+- Optional manually deployed GitHub Pages player backed by a public Raydio URL.
 - SQLite catalog and persistent schedule.
 - Worker-owned ffmpeg preprocessing into clean MP3:
   - 48 kHz
@@ -137,6 +138,32 @@ tunnel.
 
 Runtime data is stored in the named volume `raydio-data`. The worker inbox is
 `/srv/raydio/data/inbox/<radio-uuid>` inside that volume.
+
+## GitHub Pages
+
+The browser player can also be published as a static GitHub Pages site while
+the audio, API, Server-Sent Events, and covers continue to come from a running
+Raydio server.
+
+First set the repository's Pages publishing source to **GitHub Actions**. Then
+open **Actions**, run the **Deploy Pages** workflow manually, and provide
+`base_url`, for example:
+
+```text
+https://radio.example.com
+https://example.com/raydio
+```
+
+`base_url` must be a public HTTPS URL without credentials, a query, or a
+fragment. A path prefix and port are supported. The value is embedded in the
+public static site and must not contain a secret.
+
+The Pages assets use relative paths, so both account sites such as
+`https://foo.github.io/` and project sites such as
+`https://foo.github.io/raydio/` work without a repository name baked into the
+frontend. The station query remains on the Pages URL, while all runtime
+requests and copied stream commands use `base_url`. Opening the player directly
+from the Raydio server continues to use the server's own origin.
 
 ## Command-Line Flags
 
@@ -271,6 +298,11 @@ The browser player lists `all` first and selects it by default. Use
 `/?raydio=<alias-or-uuid>` to open a specific station; a missing or unknown
 `raydio` value is normalized to `/?raydio=all` while preserving other query
 parameters.
+
+The public read-only `GET /api/stations` and `GET /radio/**` resources return
+`Access-Control-Allow-Origin: *` so a Pages player can read them without
+credentials. CORS does not enable write methods, and normal request and
+connection limits still apply.
 
 `/radio/{uuid-or-alias}/api/catalog` is paginated. Use `limit` to request up to
 500 tracks and pass the returned `nextCursor` as `cursor` to read the next page.
@@ -474,6 +506,8 @@ location /radio/ {
 Run tests:
 
 ```bash
+python3 -m unittest scripts.build_pages_test
+node --test web/app.test.mjs
 CGO_ENABLED=1 go test ./...
 CGO_ENABLED=1 go test -race ./...
 CGO_ENABLED=1 go vet ./...

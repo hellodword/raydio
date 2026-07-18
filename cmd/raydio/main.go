@@ -290,7 +290,7 @@ func run(ctx context.Context, cfg config) error {
 	a.routes(mux)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           newSecurityHeadersMiddleware(newRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, clientIPs, mux)),
+		Handler:           newSecurityHeadersMiddleware(newCORSMiddleware(newRateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, clientIPs, mux))),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		IdleTimeout:       60 * time.Second,
@@ -375,6 +375,7 @@ func validateConfig(cfg config) error {
 
 func (a *app) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /", a.handleIndex)
+	mux.HandleFunc("GET /config.js", a.static("config.js", "application/javascript; charset=utf-8"))
 	mux.HandleFunc("GET /app.js", a.static("app.js", "application/javascript; charset=utf-8"))
 	mux.HandleFunc("GET /styles.css", a.static("styles.css", "text/css; charset=utf-8"))
 	mux.HandleFunc("GET /api/stations", a.handleStations)
@@ -505,6 +506,36 @@ func newSecurityHeadersMiddleware(next http.Handler) http.Handler {
 		h.Set("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; script-src 'self'; style-src 'self'; base-uri 'none'; frame-ancestors 'none'")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func newCORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !publicCORSPath(r.URL.Path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		h := w.Header()
+		switch r.Method {
+		case http.MethodGet:
+			h.Set("Access-Control-Allow-Origin", "*")
+		case http.MethodOptions:
+			if r.Header.Get("Origin") == "" || !strings.EqualFold(strings.TrimSpace(r.Header.Get("Access-Control-Request-Method")), http.MethodGet) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			h.Set("Access-Control-Allow-Origin", "*")
+			h.Set("Access-Control-Allow-Methods", http.MethodGet)
+			h.Set("Access-Control-Allow-Headers", "Cache-Control, Last-Event-ID")
+			h.Set("Access-Control-Max-Age", "600")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func publicCORSPath(path string) bool {
+	return path == "/api/stations" || strings.HasPrefix(path, "/radio/")
 }
 
 type clientLimiter struct {
@@ -938,6 +969,7 @@ func internalServerError(w http.ResponseWriter, r *http.Request, msg string, err
 func loadWebFiles() (map[string]webFile, error) {
 	files := map[string]string{
 		"index.html": "text/html; charset=utf-8",
+		"config.js":  "application/javascript; charset=utf-8",
 		"app.js":     "application/javascript; charset=utf-8",
 		"styles.css": "text/css; charset=utf-8",
 	}

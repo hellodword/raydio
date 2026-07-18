@@ -43,7 +43,9 @@ class FakeElement {
   }
 }
 
-function startPlayer(href, stations) {
+function startPlayer(href, stations, options = {}) {
+  const apiBaseUrl = options.apiBaseUrl || "";
+  const now = options.now || { isSilence: true, track: null };
   const ids = [
     "audio",
     "station",
@@ -59,6 +61,7 @@ function startPlayer(href, stations) {
   ];
   const elements = Object.fromEntries(ids.map((id) => [id, new FakeElement()]));
   const fetches = [];
+  const eventSources = [];
   const history = [];
   const window = {
     location: { href },
@@ -71,6 +74,7 @@ function startPlayer(href, stations) {
   };
 
   const context = {
+    RAYDIO_CONFIG: { apiBaseUrl },
     URL,
     console,
     document: {
@@ -80,22 +84,26 @@ function startPlayer(href, stations) {
       getElementById: (id) => elements[id],
     },
     EventSource: class {
+      constructor(url) {
+        eventSources.push(url);
+      }
+
       addEventListener() {}
       close() {}
     },
     fetch: async (url) => {
       fetches.push(url);
-      if (url === "/api/stations") {
+      if (String(url).endsWith("/api/stations")) {
         return { ok: true, json: async () => ({ stations }) };
       }
-      return { ok: true, json: async () => ({ isSilence: true, track: null }) };
+      return { ok: true, json: async () => now };
     },
     navigator: {},
     window,
   };
 
   vm.runInNewContext(appSource, context, { filename: "app.js" });
-  return { elements, fetches, history, window };
+  return { elements, eventSources, fetches, history, window };
 }
 
 async function settle() {
@@ -120,6 +128,9 @@ test("puts all first and makes it the URL-backed default", async () => {
   );
   assert.equal(player.elements.station.value, "all");
   assert.equal(player.elements.audio.src, "/radio/all");
+  assert.deepEqual(player.fetches, ["/api/stations", "/radio/all/api/now"]);
+  assert.deepEqual(player.eventSources, ["/radio/all/api/events"]);
+  assert.equal(player.elements.streamUrl.textContent, "https://example.test/radio/all");
 
   const currentURL = new URL(player.window.location.href);
   assert.equal(currentURL.searchParams.get("raydio"), "all");
@@ -162,6 +173,48 @@ test("falls back invalid values to all and keeps the URL in sync", async () => {
   const currentURL = new URL(player.window.location.href);
   assert.equal(player.elements.station.value, "bar");
   assert.equal(currentURL.searchParams.get("raydio"), "bar");
+  assert.equal(currentURL.searchParams.get("theme"), "dark");
+  assert.equal(currentURL.hash, "#current");
+});
+
+test("uses the configured API base from a project Pages URL", async () => {
+  const apiBaseUrl = "https://api.example.test/raydio-api/";
+  const player = startPlayer(
+    "https://foo.github.io/raydio/?theme=dark#current",
+    stationFixtures,
+    {
+      apiBaseUrl,
+      now: {
+        isSilence: false,
+        track: {
+          id: "track-1",
+          title: "Track",
+          artist: "Artist",
+          coverUrl: "/radio/all/covers/track-1",
+        },
+      },
+    },
+  );
+  await settle();
+
+  const normalizedBase = "https://api.example.test/raydio-api";
+  assert.deepEqual(player.fetches, [
+    `${normalizedBase}/api/stations`,
+    `${normalizedBase}/radio/all/api/now`,
+  ]);
+  assert.equal(player.elements.audio.src, `${normalizedBase}/radio/all`);
+  assert.deepEqual(player.eventSources, [`${normalizedBase}/radio/all/api/events`]);
+  assert.equal(
+    player.elements.cover.src,
+    `${normalizedBase}/radio/all/covers/track-1?v=track-1`,
+  );
+  assert.equal(player.elements.streamUrl.textContent, `${normalizedBase}/radio/all`);
+  assert.ok(player.elements.streamCommand.textContent.includes(`'${normalizedBase}/radio/all'`));
+
+  const currentURL = new URL(player.window.location.href);
+  assert.equal(currentURL.origin, "https://foo.github.io");
+  assert.equal(currentURL.pathname, "/raydio/");
+  assert.equal(currentURL.searchParams.get("raydio"), "all");
   assert.equal(currentURL.searchParams.get("theme"), "dark");
   assert.equal(currentURL.hash, "#current");
 });

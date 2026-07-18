@@ -501,6 +501,96 @@ func TestRateLimitMiddlewareLimitsAPIAndExemptsHealthz(t *testing.T) {
 	}
 }
 
+func TestCORSMiddlewareAllowsPublicReadRoutes(t *testing.T) {
+	handler := newCORSMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, path := range []string{
+		"/api/stations",
+		"/radio/monthly",
+		"/radio/monthly/api/now",
+		"/radio/monthly/api/events",
+		"/radio/monthly/covers/track-1",
+	} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Origin", "https://foo.github.io")
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d", rr.Code)
+			}
+			if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Fatalf("Access-Control-Allow-Origin = %q", got)
+			}
+		})
+	}
+}
+
+func TestCORSMiddlewareHandlesPublicReadPreflight(t *testing.T) {
+	nextCalled := false
+	handler := newCORSMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest(http.MethodOptions, "/radio/monthly/api/events", nil)
+	req.Header.Set("Origin", "https://foo.github.io")
+	req.Header.Set("Access-Control-Request-Method", http.MethodGet)
+	req.Header.Set("Access-Control-Request-Headers", "last-event-id")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if nextCalled {
+		t.Fatal("preflight reached the wrapped handler")
+	}
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("status = %d", rr.Code)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Origin = %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Methods"); got != http.MethodGet {
+		t.Fatalf("Access-Control-Allow-Methods = %q", got)
+	}
+	if got := rr.Header().Get("Access-Control-Allow-Headers"); got != "Cache-Control, Last-Event-ID" {
+		t.Fatalf("Access-Control-Allow-Headers = %q", got)
+	}
+}
+
+func TestCORSMiddlewareDoesNotExposeOtherRoutesOrMethods(t *testing.T) {
+	handler := newCORSMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tests := []struct {
+		name            string
+		method          string
+		path            string
+		preflightMethod string
+	}{
+		{name: "index", method: http.MethodGet, path: "/"},
+		{name: "health", method: http.MethodGet, path: "/healthz"},
+		{name: "write method", method: http.MethodPost, path: "/api/stations"},
+		{name: "write preflight", method: http.MethodOptions, path: "/api/stations", preflightMethod: http.MethodPost},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Origin", "https://foo.github.io")
+			if tc.preflightMethod != "" {
+				req.Header.Set("Access-Control-Request-Method", tc.preflightMethod)
+			}
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d", rr.Code)
+			}
+			if got := rr.Header().Get("Access-Control-Allow-Origin"); got != "" {
+				t.Fatalf("Access-Control-Allow-Origin = %q", got)
+			}
+		})
+	}
+}
+
 func TestRateLimitMiddlewareUsesShards(t *testing.T) {
 	handler := newRateLimitMiddleware(10, 10, mustClientIPResolver(t, nil, nil), http.NewServeMux())
 	m, ok := handler.(*rateLimitMiddleware)
@@ -746,6 +836,13 @@ func TestServeWebFileUsesPreloadedBytesAndETag(t *testing.T) {
 	}
 	if !strings.Contains(rr.Body.String(), "<!doctype html>") {
 		t.Fatalf("unexpected body prefix: %.40q", rr.Body.String())
+	}
+	config, ok := files["config.js"]
+	if !ok {
+		t.Fatal("default API config is not preloaded")
+	}
+	if !strings.Contains(string(config.Data), `"apiBaseUrl":""`) {
+		t.Fatalf("unexpected default API config: %q", config.Data)
 	}
 }
 

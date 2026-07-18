@@ -9,11 +9,37 @@ const coverFallback = document.getElementById("coverFallback");
 const streamUrl = document.getElementById("streamUrl");
 const streamCommand = document.getElementById("streamCommand");
 const copyStatus = document.getElementById("copyStatus");
+const apiBaseURL = configuredAPIBaseURL();
 
 let currentNow = null;
 let stations = [];
 let currentStation = null;
 let events = null;
+
+function configuredAPIBaseURL() {
+  const value = globalThis.RAYDIO_CONFIG?.apiBaseUrl;
+  if (typeof value !== "string" || !value) return "";
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "https:" ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      return "";
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch (_err) {
+    return "";
+  }
+}
+
+function apiURL(path) {
+  if (!apiBaseURL) return path;
+  return new URL(String(path).replace(/^\/+/, ""), `${apiBaseURL}/`).toString();
+}
 
 playButton.addEventListener("click", async () => {
   if (!currentStation) {
@@ -81,7 +107,7 @@ function stationPath() {
 
 function stationURL() {
   if (!currentStation) return "";
-  return new URL(stationPath(), window.location.href).toString();
+  return new URL(apiURL(stationPath()), window.location.href).toString();
 }
 
 function shellQuote(value) {
@@ -183,7 +209,7 @@ function fallbackCopyText(text) {
 }
 
 async function loadStations() {
-  const res = await fetch("/api/stations", { cache: "no-store" });
+  const res = await fetch(apiURL("/api/stations"), { cache: "no-store" });
   if (!res.ok) throw new Error(`stations ${res.status}`);
   const body = await res.json();
   stations = (Array.isArray(body.stations) ? body.stations : []).filter(
@@ -223,7 +249,7 @@ function setStation(station) {
     events = null;
   }
   stopAudio("ready");
-  audio.src = stationPath();
+  audio.src = apiURL(stationPath());
   resetTrackState();
   statusText.textContent = "ready";
   loadNow().catch(() => {
@@ -233,7 +259,7 @@ function setStation(station) {
 }
 
 async function loadNow() {
-  const res = await fetch(`${stationPath()}/api/now`, { cache: "no-store" });
+  const res = await fetch(apiURL(`${stationPath()}/api/now`), { cache: "no-store" });
   if (!res.ok) throw new Error(`now ${res.status}`);
   renderNow(await res.json());
 }
@@ -265,7 +291,7 @@ function renderNow(now) {
   statusText.textContent = audio.paused ? "ready" : "playing";
 
   if (now.track.coverUrl) {
-    cover.src = `${now.track.coverUrl}?v=${encodeURIComponent(now.track.id)}`;
+    cover.src = `${apiURL(now.track.coverUrl)}?v=${encodeURIComponent(now.track.id)}`;
     cover.style.display = "block";
     coverFallback.style.display = "none";
   } else {
@@ -276,7 +302,7 @@ function renderNow(now) {
 }
 
 function connectEvents() {
-  events = new EventSource(`${stationPath()}/api/events`);
+  events = new EventSource(apiURL(`${stationPath()}/api/events`));
   events.addEventListener("now", (ev) => renderNow(JSON.parse(ev.data)));
   events.addEventListener("open", () => {
     statusText.textContent = audio.paused ? "ready" : "playing";
